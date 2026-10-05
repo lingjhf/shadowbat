@@ -1,0 +1,26 @@
+name: Native proxy validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: macOS loopback and helper validation
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install local Shadowsocks fixture server
+        run: brew install shadowsocks-rust
+      - run: python3 scripts/test-helper.py
+      - run: python3 scripts/test-local.py

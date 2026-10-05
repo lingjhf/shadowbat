@@ -1,0 +1,164 @@
+import Cocoa
+import Combine
+import FlutterMacOS
+import SwiftUI
+
+/// One native model owns the core, credentials and both user interfaces.
+@MainActor
+final class ShadowbatBridge: NSObject, FlutterStreamHandler {
+    let model: ConnectionViewModel
+    #if DEBUG
+    private static let previewMode = CommandLine.arguments.contains("--isolated-preview")
+    #else
+    private static let previewMode = false
+    #endif
+    private static func makeModel() -> ConnectionViewModel {
+        #if DEBUG
+        if previewMode {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("shadowbat-preview-\(ProcessInfo.processInfo.processIdentifier)")
+            let defaults = UserDefaults(suiteName: "com.lingj.shadowbat.preview.\(ProcessInfo.processInfo.processIdentifier)")!
+            return ConnectionViewModel(directory: directory, defaults: defaults,
+                keychain: KeychainStore(service: "com.lingj.shadowbat.preview.passwords"),
+                terminalManager: TerminalProxyManager(directory: directory, zshrc: directory.appendingPathComponent(".zshrc")),
+                observeEnvironment: false)
+        }
+        #endif
+        return ConnectionViewModel()
+    }
+    private var methods: FlutterMethodChannel!
+    private var events: FlutterEventChannel!
+    private var sink: FlutterEventSink?
+    private var observation: AnyCancellable?
+    private var statusItem: NSStatusItem!
+    private let popover = NSPopover()
+    private weak var mainWindow: NSWindow?
+
+    init(controller: FlutterViewController, window: NSWindow) {
+        model = Self.makeModel()
+        super.init()
+        mainWindow = window
+        methods = FlutterMethodChannel(name: "com.lingj.shadowbat/commands", binaryMessenger: controller.engine.binaryMessenger)
+        events = FlutterEventChannel(name: "com.lingj.shadowbat/state", binaryMessenger: controller.engine.binaryMessenger)
+        events.setStreamHandler(self)
+        methods.setMethodCallHandler { [weak self] call, result in
+            Task { @MainActor in await self?.handle(call, result: result) }
+        }
+        observation = model.objectWillChange.sink { [weak self] in
+            // @Published emits before mutation; coalesce on the next main queue turn.
+            DispatchQueue.main.async { self?.publish() }
+        }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(toggleTray)
+        statusItem.button?.toolTip = "Shadowbat"
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(rootView: TrayPanelView(model: model) { [weak self] in self?.showMainWindow() })
+        publish()
+    }
+
+    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        sink = events
+        publish()
+        return nil
+    }
+
+    func onCancel(withArguments arguments: Any?) -> FlutterError? { sink = nil; return nil }
+
+    private func publish() {
+        statusItem.button?.image = NSImage(systemSymbolName: model.state == .connected ? "network" : "network.slash", accessibilityDescription: model.state.label)
+        sink?(snapshot())
+    }
+
+    func snapshot() -> [String: Any] {
+        [
+            "profiles": model.profiles.map { p in ["id": p.id.uuidString, "name": p.name, "host": p.host, "port": p.port, "method": p.method, "participatesInAutomaticSelection": p.participatesInAutomaticSelection] as [String: Any] },
+            "selectedID": model.selectedID?.uuidString as Any? ?? NSNull(),
+            "manualID": model.manualID?.uuidString as Any? ?? NSNull(),
+            "activeCandidateIDs": model.activeCandidateIDs.map(\.uuidString),
+            "selectionMode": model.selectionMode.rawValue,
+            "state": String(describing: model.state), "stateLabel": model.state.label,
+            "connectionDescription": model.connectionDescription,
+            "serviceEnabled": model.serviceEnabled, "busy": model.busy,
+            "canChangeSelection": model.canChangeSelection, "canConnect": model.canConnect,
+            "serviceUnavailable": model.state == .stopping || model.systemProxyBusy || (!model.serviceEnabled && !model.canConnect),
+            "systemProxyEnabled": model.systemProxyEnabled, "systemProxySwitch": model.systemProxySwitch,
+            "useSystemProxy": model.useSystemProxy, "useTerminalProxy": model.useTerminalProxy,
+            "terminalProxyEnabled": model.terminalProxyEnabled, "terminalIntegrationInstalled": model.terminalIntegrationInstalled,
+            "helperInstallation": String(describing: model.helperInstallation), "helperLabel": model.helperInstallation.label,
+            "recoveryNeeded": model.recoveryNeeded, "socksPort": model.socksPort, "httpPort": model.httpPort,
+            "testing": model.testing, "testResult": model.testResult as Any? ?? NSNull(),
+            "networkAvailable": model.networkAvailable, "errorMessage": model.errorMessage as Any? ?? NSNull(),
+            "logs": model.logs.map { ["id": $0.id.uuidString, "date": ISO8601DateFormatter().string(from: $0.date), "text": $0.text] }
+        ]
+    }
+
+    private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) async {
+        let args = call.arguments as? [String: Any] ?? [:]
+        do {
+            if Self.previewMode && ["installProxyHelper", "recoverSystemProxy", "openApprovalSettings", "refreshHelper"].contains(call.method) {
+                throw ClientError.message("隔离预览不操作系统代理授权。")
+            }
+            switch call.method {
+            case "snapshot": result(snapshot()); return
+            case "setService": model.setServiceEnabled(try boolean(args))
+            case "setSystemProxy": model.setSystemProxy(try boolean(args))
+            case "setTerminalProxy": model.setTerminalProxy(try boolean(args))
+            case "setSelectionMode":
+                guard let mode = NodeSelectionMode(rawValue: args["value"] as? String ?? "") else { throw ClientError.message("未知节点选择模式。") }
+                model.setSelectionMode(mode)
+            case "setManualNode": model.setManualNode((args["id"] as? String).flatMap(UUID.init(uuidString:)))
+            case "selectProfile": model.selectedID = (args["id"] as? String).flatMap(UUID.init(uuidString:))
+            case "password": result(try model.password(for: try profile(args))); return
+            case "saveProfile":
+                guard let name = args["name"] as? String, let host = args["host"] as? String,
+                      let port = args["port"] as? Int, let method = args["method"] as? String,
+                      let password = args["password"] as? String else { throw ClientError.message("节点信息不完整。") }
+                let id: UUID
+                if let raw = args["id"] as? String {
+                    guard let parsed = UUID(uuidString: raw) else { throw ClientError.message("无效节点标识。") }
+                    id = parsed
+                } else { id = UUID() }
+                try model.save(ServerProfile(id: id, name: name, host: host, port: port, method: method,
+                    participatesInAutomaticSelection: args["participatesInAutomaticSelection"] as? Bool ?? true), password: password)
+            case "deleteProfile": model.delete(try profile(args))
+            case "setParticipation": model.setAutomaticParticipation(try boolean(args), for: try profile(args))
+            case "setPorts":
+                guard model.canChangeSelection else { throw ClientError.message("请先关闭代理服务。") }
+                guard let socks = args["socks"] as? Int, let http = args["http"] as? Int else { throw ClientError.message("无效端口。") }
+                let ports = LocalPorts(socks: socks, http: http); try ports.validate()
+                model.socksPort = socks; model.httpPort = http
+            case "testConnection": model.testConnection()
+            case "recoverSystemProxy": model.recoverSystemProxy()
+            case "installProxyHelper": model.installProxyHelper()
+            case "refreshHelper": await model.refreshHelperInstallation()
+            case "openApprovalSettings": model.openHelperApprovalSettings()
+            case "installTerminalIntegration": model.installTerminalIntegration()
+            case "copyActivationCommand":
+                NSPasteboard.general.clearContents(); NSPasteboard.general.setString(model.terminalActivationCommand, forType: .string)
+            case "clearLogs": model.clearLogs()
+            case "dismissError": model.errorMessage = nil
+            default: result(FlutterMethodNotImplemented); return
+            }
+            result(nil)
+            publish()
+        } catch { result(FlutterError(code: "shadowbat", message: error.localizedDescription, details: nil)) }
+    }
+
+    private func boolean(_ args: [String: Any]) throws -> Bool {
+        guard let value = args["value"] as? Bool else { throw ClientError.message("缺少开关值。") }; return value
+    }
+    private func profile(_ args: [String: Any]) throws -> ServerProfile {
+        guard let raw = args["id"] as? String, let id = UUID(uuidString: raw), let p = model.profiles.first(where: { $0.id == id }) else { throw ClientError.message("节点不存在。") }; return p
+    }
+    @objc private func toggleTray() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown { popover.performClose(nil) }
+        else { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
+    }
+    func showMainWindow() {
+        popover.performClose(nil)
+        NSApp.setActivationPolicy(.regular)
+        mainWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
