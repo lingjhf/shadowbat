@@ -94,7 +94,10 @@ jobs:
           ./scripts/package-windows.ps1 -RuntimeDirectory $crt.DirectoryName
       - name: Build EXE installer
         shell: pwsh
-        run: ./scripts/package-windows-installer.ps1
+        run: |
+          ./scripts/package-windows-installer.ps1
+          $installer = Get-ChildItem dist/windows/*-setup.exe | Select-Object -First 1
+          ./scripts/verify-windows-installer.ps1 -InstallerPath $installer.FullName
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-x64

@@ -13,9 +13,13 @@ if ((Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash -ne $expecte
 if (-not $CompilerPath) {
   $command=Get-Command ISCC.exe -ErrorAction SilentlyContinue
   if ($command) { $CompilerPath=$command.Source }
-  else { $CompilerPath=Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe' }
+  else {
+    $candidates=@((Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+                  (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'))
+    $CompilerPath=$candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+  }
 }
-if (-not (Test-Path -LiteralPath $CompilerPath)) { throw 'Install Inno Setup 6 or supply -CompilerPath.' }
+if (-not $CompilerPath -or -not (Test-Path -LiteralPath $CompilerPath)) { throw 'Install Inno Setup 6 or supply -CompilerPath.' }
 # Installer remains unsigned until a trusted release certificate is configured.
 $name="Shadowbat-$version-windows-x64-unsigned-setup"
 $output=Join-Path $destination "$name.exe"
