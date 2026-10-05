@@ -13,6 +13,8 @@ concurrency:
 jobs:
   validate:
     name: macOS loopback and helper validation
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     if: github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 25
