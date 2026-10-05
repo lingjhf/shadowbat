@@ -8,7 +8,7 @@ import tempfile
 import uuid
 import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-EXCLUDE = {'.git', '.dart_tool', 'build', '.idea', '.DS_Store', 'ephemeral', '.swiftpm', '__pycache__'}
+EXCLUDE = {'.git', '.dart_tool', 'build', '.idea', '.DS_Store', 'ephemeral', '.swiftpm', '__pycache__', 'dist'}
 with tempfile.TemporaryDirectory(prefix='shadowbat-sync-') as temporary:
     name = 'shadowbat-sync-' + uuid.uuid4().hex + '.tar.gz'
     archive = pathlib.Path(temporary) / name

@@ -127,7 +127,7 @@ open -n build/macos/Build/Products/Debug/shadowbat.app --args --isolated-preview
 
 远程仓库为 `git@github.com:lingjhf/shadowbat.git`。沿用 `cutdex_agent` 的 `main` 主分支与 `v*` 标签发布方式：日常改动在功能分支完成并提交到 `main`；`pubspec.yaml` 是应用版本的唯一来源，当前为 `1.0.0+1`。`+1` 是 Flutter 构建号，发布标签需完整匹配 `v1.0.0+1`。
 
-CI 在指向 `main` 的 PR、`main` 推送、`v*` 标签推送及手动触发时运行，固定使用 Flutter 3.47.5。它检查格式、静态分析和版本，执行 Linux/Windows/macOS 的 Flutter 测试，构建 Windows x64 与 macOS arm64，并生成 ZIP 与 SHA-256 文件。工作流 Action 固定到提交 SHA；Dependabot 每周检查 Action 更新。汇总检查名为 `CI passed`，可设为主分支必过检查。
+CI 在指向 `main` 的 PR、`main` 推送、`v*` 标签推送及手动触发时运行，固定使用 Flutter 3.47.5。它检查格式、静态分析和版本，执行 Linux/Windows/macOS 的 Flutter 测试，构建 Windows x64 与 macOS arm64，并生成 macOS DMG、Windows EXE 安装包和便携 ZIP，以及 SHA-256 文件。工作流 Action 固定到提交 SHA；Dependabot 每周检查 Action 更新。汇总检查名为 `CI passed`，可设为主分支必过检查。
 
 发布时先更新 `pubspec.yaml` 和 `CHANGELOG.md`，将代码合并到 `main`，然后从对应提交创建标签：
 
@@ -137,6 +137,8 @@ git tag -a v1.0.0+1 -m 'Shadowbat 1.0.0+1'
 git push origin v1.0.0+1
 ```
 
-标签触发完整 CI，通过后检查标签与版本一致、提交属于 `main`，再创建 GitHub Release 并上传两个平台的 ZIP 与校验文件。带预发布后缀（如 `1.1.0-beta.1+2`）的标签发布为 prerelease。应用保持 `publish_to: none`，不会发布到 pub.dev。
+标签触发完整 CI，通过后检查标签与版本一致、提交属于 `main`，再创建 GitHub Release 并上传 macOS DMG、Windows EXE 安装包、便携 ZIP 与校验文件。带预发布后缀（如 `1.1.0-beta.1+2`）的标签发布为 prerelease。应用保持 `publish_to: none`，不会发布到 pub.dev。
 
 Windows CI 产物未签名；macOS CI 产物为 ad-hoc 签名，未经 Apple 公证，其系统代理辅助程序仍需正式团队签名才能用于授权安装。正式分发签名应在独立的受控发布流程中完成，证书、私钥及个人节点配置不进入 Git。`Native proxy validation` 对应参考项目的手动验证工作流，仅从 `main` 执行 macOS 本地加密转发与辅助程序测试；Windows 完整凭据/TUN 集成验证使用真机测试脚本。
+
+Windows EXE 安装包使用 Inno Setup 6。先生成便携 ZIP，再执行 `scripts/package-windows-installer.ps1`；默认安装到当前用户的应用目录，无需管理员权限，TUN 仍通过应用的 UAC 流程启用。macOS 执行 `scripts/package-macos.sh` 生成带 Applications 快捷入口的 DMG。

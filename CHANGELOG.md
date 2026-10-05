@@ -6,5 +6,6 @@
 - Native macOS tray and Swift proxy services retained from Shadowbat macOS.
 - Native Win32 tray, Credential Manager, system proxy restoration and PowerShell integration.
 - Windows sing-box and Wintun support, including administrator restart for TUN.
+- macOS DMG and Windows EXE installer.
 - Portable Windows ZIP with app-local Visual C++ runtime and file integrity checks.
 - CI checks, desktop builds and version-tagged GitHub releases.

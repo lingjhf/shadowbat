@@ -67,7 +67,7 @@ jobs:
       - run: flutter test --reporter expanded
 
   windows:
-    name: Windows x64 build and ZIP
+    name: Windows x64 build, EXE and ZIP
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
@@ -92,10 +92,14 @@ jobs:
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $crt) { throw 'Redistributable x64 CRT not found' }
           ./scripts/package-windows.ps1 -RuntimeDirectory $crt.DirectoryName
+      - name: Build EXE installer
+        shell: pwsh
+        run: ./scripts/package-windows-installer.ps1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-x64
           path: |
+            dist/windows/*.exe
             dist/windows/*.zip
             dist/windows/*.sha256
           if-no-files-found: error
@@ -119,19 +123,13 @@ jobs:
       - run: flutter pub get --enforce-lockfile
       - run: python3 scripts/test-helper.py
       - run: sh scripts/build-macos-ci.sh
-      - name: Package ad-hoc app
-        shell: bash
-        run: |
-          version=$(python3 scripts/check-version.py)
-          mkdir -p dist/macos
-          archive="dist/macos/Shadowbat-$version-macos-arm64-ad-hoc.zip"
-          ditto -c -k --sequesterRsrc --keepParent build/macos-ci/Build/Products/Release/shadowbat.app "$archive"
-          (cd dist/macos && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+      - name: Package and verify DMG
+        run: sh scripts/package-macos.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-arm64
           path: |
-            dist/macos/*.zip
+            dist/macos/*.dmg
             dist/macos/*.sha256
           if-no-files-found: error
           retention-days: 14
