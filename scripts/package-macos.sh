@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
+. ./scripts/retry-hdiutil.sh
 app=${1:-build/macos-ci/Build/Products/Release/shadowbat.app}
 signing=${2:-ad-hoc}
 case "$signing" in ad-hoc|development) ;; *) printf 'Unsupported signing mode: %s\n' "$signing" >&2; exit 1 ;; esac
@@ -18,7 +19,7 @@ test ! -e "$image"
 staging=$(mktemp -d)
 mount=$(mktemp -d)
 cleanup() {
-  if mount | grep -F " on $mount " >/dev/null; then hdiutil detach "$mount" >/dev/null; fi
+  if mount | grep -F " on $mount " >/dev/null; then hdiutil_with_retry detach "$mount" >/dev/null; fi
   rm -rf "$staging" "$mount"
 }
 trap cleanup EXIT HUP INT TERM
@@ -38,8 +39,8 @@ The privileged system-proxy helper requires formal team signing for installation
 NOTE
 fi
 hdiutil create -volname Shadowbat -srcfolder "$staging" -format UDZO "$image"
-hdiutil verify "$image"
-hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$image" >/dev/null
+hdiutil_with_retry verify "$image"
+hdiutil_with_retry attach -readonly -nobrowse -mountpoint "$mount" "$image" >/dev/null
 test -f "$mount/Shadowbat.app/Contents/Info.plist"
 test "$(readlink "$mount/Applications")" = /Applications
 codesign --verify --deep --strict "$mount/Shadowbat.app"
@@ -47,6 +48,6 @@ codesign --verify --deep --strict "$mount/Shadowbat.app"
 installed=$(mktemp -d "$staging/installed-XXXXXXXX")
 ditto "$mount/Shadowbat.app" "$installed/Shadowbat.app"
 python3 scripts/test-macos-startup.py "$installed/Shadowbat.app"
-hdiutil detach "$mount" >/dev/null
+hdiutil_with_retry detach "$mount" >/dev/null
 (cd dist/macos && shasum -a 256 "$(basename "$image")" > "$(basename "$image").sha256")
 printf 'Verified DMG: %s\n' "$image"

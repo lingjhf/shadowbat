@@ -8,6 +8,7 @@
 - Preserve active lease conflicts without restarting the helper; refresh approval status and clear stale receipts only after confirmed restoration.
 - Add isolated recovery and real anonymous XPC timeout regression checks.
 - Keep TUN control directories alive when the elevated launcher exists but cannot be signalled by the desktop user.
+- Retry transient DiskImages contention during DMG verification and mounting, retaining fatal checksum and format failures.
 
 ## 1.3.7+15
 
