@@ -294,8 +294,8 @@ final class ProcessProxyEngine {
         let script = """
         alive() {
           # A sudo launcher belongs to root: kill -0 returns EPERM while it is alive.
-          # ps checks existence without requiring permission to signal the process.
-          /bin/ps -p "$1" -o pid= >/dev/null 2>&1
+          # Keep the cheap signal probe for owned processes; ps handles EPERM.
+          kill -0 "$1" 2>/dev/null || /bin/ps -p "$1" -o pid= >/dev/null 2>&1
         }
         owned() {
           alive "$2" || return 1
