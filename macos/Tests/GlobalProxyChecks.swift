@@ -37,6 +37,7 @@ enum GlobalProxyChecks {
         while model.state == .starting && Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
         do {
             try SmokeChecks.check(model.state == .connected, "Global startup failed: \(model.errorMessage ?? "timeout")")
+            try SmokeChecks.mustThrow("Active connection accepted a TUN mode change") { try model.setTun(true) }
             try SmokeChecks.check(model.activeCandidateIDs == Set([profile.id, other.id]) && model.terminalProxyEnabled,
                                   "Global startup did not activate its candidate pool and terminal proxy")
             let stateBeforeBrowsing = try Data(contentsOf: terminal.stateFile)
@@ -55,7 +56,12 @@ enum GlobalProxyChecks {
                                   "Terminal switch stopped the global service or left environment state enabled")
             model.setTerminalProxy(true)
             try SmokeChecks.check(model.terminalProxyEnabled, "Terminal switch did not re-enable on the shared service")
-            let disconnected = await model.disconnect()
+            let firstDisconnect = Task { await model.disconnect() }
+            let secondDisconnect = Task { await model.disconnect() }
+            firstDisconnect.cancel()
+            let disconnected = await firstDisconnect.value
+            let secondResult = await secondDisconnect.value
+            try SmokeChecks.check(secondResult, "Overlapping disconnect returned before cleanup succeeded")
             try SmokeChecks.check(disconnected && !model.serviceEnabled && model.activeCandidateIDs.isEmpty &&
                                   !model.terminalProxyEnabled && model.useTerminalProxy,
                                   "Global shutdown did not clear runtime state and retain the desired terminal setting")
@@ -76,6 +82,7 @@ enum GlobalProxyChecks {
             try ProcessProxyEngine.checkAvailable(ports.socks)
             try ProcessProxyEngine.checkAvailable(ports.http)
             print("PASS: global switches and preferences, independent browsing/manual target, automatic startup without selection, terminal toggle and rapid on/off")
+            print("PASS: cancelled and overlapping disconnect requests share successful cleanup")
         } catch {
             _ = await model.disconnect()
             throw error

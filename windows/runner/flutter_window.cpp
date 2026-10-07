@@ -30,6 +30,7 @@ bool FlutterWindow::OnCreate() {
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
+    if (shadowbat_) shadowbat_->PrepareTray();
   });
 
   // Flutter can complete the first frame before the "show window" callback is

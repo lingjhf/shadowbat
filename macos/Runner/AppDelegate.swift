@@ -4,6 +4,7 @@ import FlutterMacOS
 @main
 class AppDelegate: FlutterAppDelegate {
   private var terminating = false
+  private var terminationReady = false
   private var closeObserver: NSObjectProtocol?
   private var bridge: ShadowbatBridge? { (mainFlutterWindow as? MainFlutterWindow)?.bridge }
 
@@ -22,22 +23,28 @@ class AppDelegate: FlutterAppDelegate {
   }
 
   override func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    if terminationReady { return .terminateNow }
     guard let model = bridge?.model else { return .terminateNow }
     guard !terminating else { return .terminateCancel }
     terminating = true
+    bridge?.beginShutdown()
     Task { @MainActor in
       let safe = await model.disconnect()
-      if !safe {
-        bridge?.showMainWindow()
+      if safe {
+        self.terminationReady = true
+        sender.terminate(nil)
+      } else {
+        bridge?.cancelShutdown()
         let alert = NSAlert()
         alert.messageText = "系统代理尚未恢复"
         alert.informativeText = "为避免网络请求指向已停止的代理，请先恢复系统代理，再退出。"
         alert.addButton(withTitle: "返回应用")
         alert.runModal()
       }
-      terminating = false
-      sender.reply(toApplicationShouldTerminate: safe)
+      self.terminating = false
     }
-    return .terminateLater
+    // AppKit's terminateLater loop can starve main-actor continuations. Keep
+    // the normal event loop running during cleanup, then terminate synchronously.
+    return .terminateCancel
   }
 }

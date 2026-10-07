@@ -1,6 +1,8 @@
 #include "shadowbat_windows.h"
 #include "resource.h"
+#include "tray_panel.h"
 #include <aclapi.h>
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <flutter/standard_method_codec.h>
@@ -16,6 +18,84 @@ namespace {
 using V = flutter::EncodableValue;
 using M = flutter::EncodableMap;
 constexpr UINT kTray = WM_APP + 42;
+constexpr UINT kNativeReply = WM_APP + 43;
+struct NativeReply {
+  enum Kind { success, error, missing } kind = success;
+  V value;
+  std::string code, message;
+};
+// Copy the reply on the worker; the engine-facing MethodResult stays on the UI thread.
+class DeferredResult : public flutter::MethodResult<V> {
+public:
+  explicit DeferredResult(std::function<void(NativeReply)> reply) : reply_(std::move(reply)) {}
+protected:
+  void SuccessInternal(const V *value) override {
+    NativeReply reply;
+    if (value) reply.value = *value;
+    reply_(std::move(reply));
+  }
+  void ErrorInternal(const std::string &code, const std::string &message, const V *details) override {
+    NativeReply reply;
+    reply.kind = NativeReply::error;
+    reply.code = code;
+    reply.message = message;
+    if (details) reply.value = *details;
+    reply_(std::move(reply));
+  }
+  void NotImplementedInternal() override {
+    NativeReply reply;
+    reply.kind = NativeReply::missing;
+    reply_(std::move(reply));
+  }
+private:
+  std::function<void(NativeReply)> reply_;
+};
+HICON NetworkIcon(bool connected) {
+  constexpr int size = 32;
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  info.bmiHeader.biWidth = size;
+  info.bmiHeader.biHeight = -size;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  void *pixels = nullptr;
+  HDC dc = CreateCompatibleDC(nullptr);
+  HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+  if (!dc || !bitmap || !pixels) {
+    if (bitmap) DeleteObject(bitmap);
+    if (dc) DeleteDC(dc);
+    return nullptr;
+  }
+  memset(pixels, 0, size * size * 4);
+  auto oldBitmap = SelectObject(dc, bitmap);
+  DWORD light = 0, bytes = sizeof(light);
+  RegGetValue(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+      L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &bytes);
+  auto pen = CreatePen(PS_SOLID, 2, connected ? (light ? RGB(35, 35, 40) : RGB(245, 245, 250)) : RGB(150, 150, 155));
+  auto oldPen = SelectObject(dc, pen);
+  auto oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+  RoundRect(dc, 11, 3, 22, 12, 3, 3);
+  MoveToEx(dc, 16, 12, nullptr); LineTo(dc, 16, 19);
+  MoveToEx(dc, 7, 22, nullptr); LineTo(dc, 7, 18); LineTo(dc, 25, 18); LineTo(dc, 25, 22);
+  RoundRect(dc, 2, 22, 13, 30, 3, 3);
+  RoundRect(dc, 20, 22, 31, 30, 3, 3);
+  if (!connected) { MoveToEx(dc, 3, 2, nullptr); LineTo(dc, 30, 30); }
+  GdiFlush();
+  auto data = static_cast<DWORD *>(pixels);
+  for (int i = 0; i < size * size; ++i) if (data[i] & 0x00ffffff) data[i] |= 0xff000000;
+  BYTE maskPixels[size * size / 8]{};
+  HBITMAP mask = CreateBitmap(size, size, 1, 1, maskPixels);
+  ICONINFO iconInfo{TRUE, 0, 0, mask, bitmap};
+  HICON icon = CreateIconIndirect(&iconInfo);
+  SelectObject(dc, oldBrush);
+  SelectObject(dc, oldPen);
+  SelectObject(dc, oldBitmap);
+  DeleteObject(pen);
+  DeleteObject(bitmap);
+  DeleteObject(mask);
+  DeleteDC(dc);
+  return icon;
+}
 constexpr wchar_t kProxyKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 std::wstring Wide(const std::string &s) {
@@ -433,10 +513,35 @@ ShadowbatWindows::ShadowbatWindows(HWND window,
   channel_->SetMethodCallHandler([this](const auto &call, auto result) {
     Handle(call, std::move(result));
   });
+  worker_ = std::thread([this] {
+    HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    for (;;) {
+      std::function<void()> work;
+      {
+        std::unique_lock<std::mutex> lock(work_mutex_);
+        work_ready_.wait(lock, [this] { return stopping_ || !work_.empty(); });
+        if (stopping_ && work_.empty()) break;
+        work = std::move(work_.front());
+        work_.pop_front();
+      }
+      work();
+    }
+    if (SUCCEEDED(com)) CoUninitialize();
+  });
   taskbar_created_ = RegisterWindowMessage(L"TaskbarCreated");
   InstallTray();
 }
 ShadowbatWindows::~ShadowbatWindows() {
+  channel_->SetMethodCallHandler(nullptr);
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    // Drain accepted work, including shutdown proxy restoration, before releasing handles.
+    stopping_ = true;
+  }
+  work_ready_.notify_one();
+  if (worker_.joinable()) worker_.join();
+  replies_.clear();
+  pending_results_.clear();
   NOTIFYICONDATA icon{};
   icon.cbSize = sizeof(icon);
   icon.hWnd = window_;
@@ -448,94 +553,62 @@ ShadowbatWindows::~ShadowbatWindows() {
     CloseHandle(job_);
 }
 void ShadowbatWindows::InstallTray() {
+  if (exiting_) return;
   NOTIFYICONDATA icon{};
   icon.cbSize = sizeof(icon);
   icon.hWnd = window_;
   icon.uID = 1;
   icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
   icon.uCallbackMessage = kTray;
-  icon.hIcon =
-      LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON));
+  HICON network = NetworkIcon(Text(state_, "state") == "connected");
+  icon.hIcon = network ? network : LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON));
   wcscpy_s(icon.szTip, L"Shadowbat");
   Shell_NotifyIcon(NIM_ADD, &icon);
+  if (network) DestroyIcon(network);
+  icon.uVersion = NOTIFYICON_VERSION_4;
+  Shell_NotifyIcon(NIM_SETVERSION, &icon);
 }
 void ShadowbatWindows::ShowWindow() {
+  if (exiting_) return;
+  if (tray_panel_) tray_panel_->Hide();
   ::ShowWindow(window_, SW_RESTORE);
   SetForegroundWindow(window_);
 }
 void ShadowbatWindows::Action(const std::string &name, M args) {
   channel_->InvokeMethod(name, std::make_unique<V>(args));
 }
+void ShadowbatWindows::PrepareTray() {
+  if (!tray_panel_) {
+    tray_panel_ = std::make_unique<TrayPanel>(window_, [this](const std::string &name, M args) {
+      if (name == "showMainWindow") ShowWindow();
+      else Action(name, std::move(args));
+    });
+    tray_panel_->Update(state_);
+    tray_panel_->Prepare();
+  }
+}
 void ShadowbatWindows::ShowMenu() {
-  HMENU menu = CreatePopupMenu();
-  auto enabled = Flag(state_, "serviceEnabled"), busy = Flag(state_, "busy");
-  AppendMenu(menu, MF_STRING | MF_GRAYED, 0,
-             Wide("Shadowbat · " + Text(state_, "stateLabel")).c_str());
-  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
-  auto append = [&](UINT id, const wchar_t *text, bool checked, bool disabled) {
-    AppendMenu(menu,
-               MF_STRING | (checked ? MF_CHECKED : 0) |
-                   (disabled ? MF_GRAYED : 0),
-               id, text);
-  };
-  append(1, L"代理服务", enabled,
-         busy || (!enabled && !Flag(state_, "canConnect")));
-  append(2, L"系统代理", Flag(state_, "systemProxy"), busy);
-  append(3, L"终端代理", Flag(state_, "terminalProxy"), busy);
-  append(4, L"TUN 隧道", Flag(state_, "useTun"), busy || enabled);
-  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
-  append(5, L"自动选择", Text(state_, "selectionMode") == "automatic",
-         busy || enabled);
-  append(6, L"手动选择", Text(state_, "selectionMode") == "manual",
-         busy || enabled);
-  const V *nodes = Get(state_, "profiles");
-  auto list = nodes ? std::get_if<flutter::EncodableList>(nodes) : nullptr;
-  if (list) {
-    for (size_t i = 0; i < list->size(); i++) {
-      auto node = std::get_if<M>(&(*list)[i]);
-      if (node)
-        append(static_cast<UINT>(100 + i), Wide(Text(*node, "name")).c_str(),
-               Text(*node, "id") == Text(state_, "manualID"), busy || enabled);
-    }
+  if (exiting_) return;
+  PrepareTray();
+  NOTIFYICONIDENTIFIER identifier{};
+  identifier.cbSize = sizeof(identifier);
+  identifier.hWnd = window_;
+  identifier.uID = 1;
+  RECT anchor{};
+  if (FAILED(Shell_NotifyIconGetRect(&identifier, &anchor))) {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    anchor = {cursor.x, cursor.y, cursor.x + 1, cursor.y + 1};
   }
-  if (Flag(state_, "recoveryNeeded"))
-    append(7, L"恢复系统代理", false, busy);
-  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
-  append(8, L"打开 Shadowbat", false, false);
-  append(9, L"退出", false, busy);
-  POINT point;
-  GetCursorPos(&point);
-  SetForegroundWindow(window_);
-  UINT id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x,
-                           point.y, 0, window_, nullptr);
-  DestroyMenu(menu);
-  PostMessage(window_, WM_NULL, 0, 0);
-  if (id == 1)
-    Action("setService", {{V("value"), V(!enabled)}});
-  else if (id == 2)
-    Action("setSystemProxy", {{V("value"), V(!Flag(state_, "systemProxy"))}});
-  else if (id == 3)
-    Action("setTerminalProxy",
-           {{V("value"), V(!Flag(state_, "terminalProxy"))}});
-  else if (id == 4)
-    Action("setTun", {{V("value"), V(!Flag(state_, "useTun"))}});
-  else if (id == 5 || id == 6)
-    Action("setSelectionMode",
-           {{V("value"), V(id == 5 ? "automatic" : "manual")}});
-  else if (id == 7)
-    Action("recoverSystemProxy");
-  else if (id == 8)
-    ShowWindow();
-  else if (id == 9)
-    Action("quit");
-  else if (id >= 100 && list && id - 100 < list->size()) {
-    auto node = std::get_if<M>(&(*list)[id - 100]);
-    if (node)
-      Action("setManualNode", {{V("id"), V(Text(*node, "id"))}});
-  }
+  tray_panel_->Toggle(anchor);
 }
 bool ShadowbatWindows::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam,
                                      LRESULT *result) {
+  if (message == kNativeReply) {
+    DrainReplies();
+    *result = 0;
+    return true;
+  }
   if (message == taskbar_created_) {
     InstallTray();
     *result = 0;
@@ -547,16 +620,18 @@ bool ShadowbatWindows::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam,
     return true;
   }
   if (message == kTray) {
-    if (lparam == WM_LBUTTONDBLCLK)
+    UINT notification = LOWORD(lparam);
+    if (notification == WM_LBUTTONDBLCLK)
       ShowWindow();
-    else if (lparam == WM_RBUTTONUP || lparam == WM_LBUTTONUP)
+    else if (notification == WM_CONTEXTMENU || notification == NIN_SELECT || notification == NIN_KEYSELECT)
       ShowMenu();
     *result = 0;
     return true;
   }
   if (message == WM_QUERYENDSESSION) {
-    bool conflict;
-    RestoreProxy(registry_, &conflict);
+    // Restoration is serialized with any in-flight proxy transaction. The detached
+    // watchdog also restores the backup if Windows terminates us before this runs.
+    QueueWork([this] { bool conflict; RestoreProxy(registry_, &conflict); });
     *result = TRUE;
     return true;
   }
@@ -575,7 +650,62 @@ bool ShadowbatWindows::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam,
   }
   return false;
 }
-void ShadowbatWindows::Handle(
+void ShadowbatWindows::QueueWork(std::function<void()> work) {
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    if (stopping_) return;
+    work_.push_back(std::move(work));
+  }
+  work_ready_.notify_one();
+}
+void ShadowbatWindows::QueueReply(std::function<void()> reply) {
+  std::lock_guard<std::mutex> lock(work_mutex_);
+  if (stopping_) return;
+  replies_.push_back(std::move(reply));
+  PostMessage(window_, kNativeReply, 0, 0);
+}
+void ShadowbatWindows::DrainReplies() {
+  std::deque<std::function<void()>> replies;
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    replies.swap(replies_);
+  }
+  for (auto &reply : replies) reply();
+}
+void ShadowbatWindows::Handle(const flutter::MethodCall<V> &call,
+                             std::unique_ptr<flutter::MethodResult<V>> result) {
+  auto name = call.method_name();
+  if (name == "updateTray" || name == "restartElevated" || name == "quit" ||
+      name == "beginShutdown" || name == "cancelShutdown") {
+    Execute(call, std::move(result));
+    return;
+  }
+  // MethodCall arguments are owned by the incoming callback, so copy before queuing.
+  V arguments = call.arguments() ? *call.arguments() : V();
+  auto response = std::shared_ptr<flutter::MethodResult<V>>(std::move(result));
+  pending_results_.push_back(response);
+  QueueWork([this, name, arguments = std::move(arguments), response] {
+    auto reply = [this, response](NativeReply answer) {
+      QueueReply([this, response, answer = std::move(answer)] {
+        if (answer.kind == NativeReply::success) response->Success(answer.value);
+        else if (answer.kind == NativeReply::error) response->Error(answer.code, answer.message, answer.value);
+        else response->NotImplemented();
+        pending_results_.erase(std::remove(pending_results_.begin(), pending_results_.end(), response), pending_results_.end());
+      });
+    };
+    try {
+      flutter::MethodCall<V> work(name, std::make_unique<V>(arguments));
+      Execute(work, std::make_unique<DeferredResult>(reply));
+    } catch (...) {
+      NativeReply error;
+      error.kind = NativeReply::error;
+      error.code = "windows";
+      error.message = "原生后台操作失败。";
+      reply(std::move(error));
+    }
+  });
+}
+void ShadowbatWindows::Execute(
     const flutter::MethodCall<V> &call,
     std::unique_ptr<flutter::MethodResult<V>> result) {
   auto args = call.arguments() ? std::get_if<M>(call.arguments()) : nullptr;
@@ -583,6 +713,32 @@ void ShadowbatWindows::Handle(
   const auto &a = args ? *args : empty;
   auto name = call.method_name();
   auto fail = [&](const char *message) { result->Error("windows", message); };
+  if (name == "beginShutdown") {
+    exiting_ = true;
+    if (tray_panel_) tray_panel_->Hide();
+    ::ShowWindow(window_, SW_HIDE);
+    NOTIFYICONDATA icon{};
+    icon.cbSize = sizeof(icon);
+    icon.hWnd = window_;
+    icon.uID = 1;
+    Shell_NotifyIcon(NIM_DELETE, &icon);
+    result->Success(V(!IsWindowVisible(window_)));
+    return;
+  }
+  if (name == "cancelShutdown") {
+    exiting_ = false;
+    InstallTray();
+    ShowWindow();
+    result->Success();
+    return;
+  }
+  if (name == "testWorkerDelay" && preview_ &&
+      std::wstring(GetCommandLine()).find(L"--self-test") != std::wstring::npos) {
+    // Deliberately slow only in the existing opt-in, isolated integration test.
+    Sleep(1200);
+    result->Success();
+    return;
+  }
   if (name == "initialize") {
     std::error_code error;
     std::filesystem::create_directories(directory_, error);
@@ -696,14 +852,18 @@ void ShadowbatWindows::Handle(
   }
   if (name == "updateTray") {
     state_ = a;
+    if (tray_panel_) tray_panel_->Update(state_);
     NOTIFYICONDATA icon{};
     icon.cbSize = sizeof(icon);
     icon.hWnd = window_;
     icon.uID = 1;
-    icon.uFlags = NIF_TIP;
+    icon.uFlags = NIF_TIP | NIF_ICON;
+    HICON network = NetworkIcon(Text(a, "state") == "connected");
+    icon.hIcon = network ? network : LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON));
     auto tip = Wide("Shadowbat · " + Text(a, "stateLabel"));
     wcsncpy_s(icon.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIcon(NIM_MODIFY, &icon);
+    if (network) DestroyIcon(network);
     result->Success();
     return;
   }

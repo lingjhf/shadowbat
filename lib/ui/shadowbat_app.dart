@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import '../domain/models/shadowbat_state.dart';
 import 'shadowbat_view_model.dart';
 import 'server_editor.dart';
+import 'routing_page.dart';
 
 const accent = Color(0xff007aff);
 
@@ -157,6 +158,26 @@ class _ShadowbatWindowState extends State<ShadowbatWindow> {
                       ...switch (page) {
                         0 => connection(),
                         1 => nodes(),
+                        2 => [
+                          RoutingPage(
+                            policy: s.routing,
+                            editable: s.canChangeSelection,
+                            onSave: (policy) async {
+                              if (!await model.command(
+                                'saveRouting',
+                                policy.toMap(),
+                              )) {
+                                throw StateError(model.error ?? '直连配置保存失败。');
+                              }
+                            },
+                            onResolve: (target) async {
+                              return (await model.repository.command(
+                                'resolveRoutingTarget',
+                                {'target': target},
+                              ) as List).cast<String>();
+                            },
+                          ),
+                        ],
                         _ => settings(),
                       },
                     ],
@@ -170,7 +191,8 @@ class _ShadowbatWindowState extends State<ShadowbatWindow> {
                 for (final (index, icon, label) in [
                   (0, Icons.power_settings_new, '连接'),
                   (1, CupertinoIcons.square_stack_3d_up, '节点'),
-                  (2, CupertinoIcons.slider_horizontal_3, '设置'),
+                  (2, CupertinoIcons.arrow_branch, '直连配置'),
+                  (3, CupertinoIcons.slider_horizontal_3, '设置'),
                 ])
                   Expanded(
                     child: Semantics(
@@ -612,14 +634,20 @@ class _ShadowbatWindowState extends State<ShadowbatWindow> {
             ),
             const SizedBox(height: 8),
             caption('虚拟网卡接管 TCP / UDP 与 DNS；局域网保持直连。开启前请关闭代理服务。'),
-            if (!s.isAdministrator)
+            if (s.isWindows && !s.isAdministrator)
               TextButton(
                 onPressed: s.canChangeSelection
                     ? () => model.command('restartElevated')
                     : null,
                 child: const Text('以管理员身份重启'),
               ),
-            caption(s.isAdministrator ? '已具备管理员权限' : 'TUN 需要管理员授权；普通代理无需提升权限。'),
+            caption(
+              s.isWindows
+                  ? s.isAdministrator
+                        ? '已具备管理员权限'
+                        : 'TUN 需要管理员授权；普通代理无需提升权限。'
+                  : '连接时由 macOS 请求管理员授权，无需重启应用。断开或退出后自动清理隧道。',
+            ),
           ],
         ),
       ),

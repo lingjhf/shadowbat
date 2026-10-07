@@ -5,6 +5,12 @@
 	objectVersion = 54;
 	archiveVersion = 1;
 	objects = {
+        C0DE70000000000000000001 = { isa = PBXFileReference; path = Shared/TunSession.swift; lastKnownFileType = sourcecode.swift; sourceTree = SOURCE_ROOT; };
+        C0DE70000000000000000002 = { isa = PBXBuildFile; fileRef = C0DE70000000000000000001; };
+        C0DE70000000000000000003 = { isa = PBXBuildFile; fileRef = C0DE70000000000000000001; };
+        C0DE70000000000000000004 = { isa = PBXFileReference; path = Native/Services/PrivilegedTunClient.swift; lastKnownFileType = sourcecode.swift; sourceTree = SOURCE_ROOT; };
+        C0DE70000000000000000005 = { isa = PBXBuildFile; fileRef = C0DE70000000000000000004; };
+
 		33CC10EA2044A3C60003C045 = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -81,6 +87,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C0DE70000000000000000002,
+				C0DE70000000000000000005,
 				33CC11132044BFA00003C045,
 				33CC10F12044A3C60003C045,
 				335BBD1B22A9A15E00E9071D,
@@ -110,7 +118,7 @@
 			sourceTree = SOURCE_ROOT;
 		};
 		C0DE00020000000000000001 = {
-			path = Tools/sslocal;
+			path = Tools/sing-box;
 			isa = PBXFileReference;
 			lastKnownFileType = "compiled.mach-o.executable";
 			sourceTree = SOURCE_ROOT;
@@ -215,6 +223,7 @@
 		C0DE1000000000000000002A = {
 			isa = PBXSourcesBuildPhase;
 			files = (
+				C0DE70000000000000000003,
 				C0DE10000000000000000014,
 				C0DE10000000000000000015,
 				C0DE10000000000000000016,
@@ -1275,7 +1284,7 @@
 		F10A7E000000000000000100 = {
 			isa = PBXFileReference;
 			lastKnownFileType = text;
-			path = "Tools/shadowsocks-rust-LICENSE.txt";
+			path = "Tools/sing-box-LICENSE.txt";
 			sourceTree = SOURCE_ROOT;
 		};
 		F10A7E000000000000000101 = {

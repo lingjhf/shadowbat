@@ -32,11 +32,11 @@ enum SmokeChecks {
     static func main() async throws {
         setbuf(stdout, nil)
         let arguments = CommandLine.arguments
-        guard arguments.count == 10,
+        guard arguments.count == 11,
               let serverPort = Int(arguments[2]), let socksPort = Int(arguments[3]),
               let httpPort = Int(arguments[4]), let fixturePort = Int(arguments[5]),
               let serverPID = Int32(arguments[6]), let secondPort = Int(arguments[7]),
-              let secondPID = Int32(arguments[8]), let deadPort = Int(arguments[9]) else { throw ClientError.message("Invalid test arguments") }
+              let secondPID = Int32(arguments[8]), let deadPort = Int(arguments[9]), let apiPort = Int(arguments[10]) else { throw ClientError.message("Invalid test arguments") }
         let executable = URL(fileURLWithPath: arguments[1])
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("shadowbat-check-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -102,9 +102,11 @@ enum SmokeChecks {
         print("PASS: profile validation, persistence, Keychain, and conflict-safe proxy restoration")
 
         let ports = LocalPorts(socks: socksPort, http: httpPort)
-        let url = "http://fixture.shadowbat.test:\(fixturePort)/"
+        try RoutingChecks.run(profile: profile, password: password, ports: ports, directory: directory)
+        try await TunCancellationChecks.run(profile: profile, password: password, ports: ports, directory: directory, executable: executable)
+        let url = "http://198.18.0.123:\(fixturePort)/"
         try await AutomaticSelectionChecks.run(executable: executable, profile: profile, password: password,
-                                               secondPort: secondPort, secondPID: secondPID, deadPort: deadPort,
+                                               secondPort: secondPort, secondPID: secondPID, deadPort: deadPort, apiPort: apiPort,
                                                ports: ports, directory: directory, terminal: terminal, url: url)
         try await GlobalProxyChecks.run(executable: executable, profile: profile, password: password,
                                        deadPort: deadPort, ports: ports, directory: directory, terminal: terminal, url: url)
@@ -113,7 +115,8 @@ enum SmokeChecks {
         engine.onLog = { logs.append($0) }
         var exitStatus: Int32?
         engine.onExit = { exitStatus = $0 }
-        try await engine.start(profile: profile, password: password, ports: ports, directory: directory, executable: executable)
+        let directSettings: [String: Any] = ["rules": [["id": "localhost", "type": "domain", "target": "localhost", "action": "direct"]]]
+        try await engine.start(profile: profile, password: password, ports: ports, directory: directory, executable: executable, routing: directSettings)
         try check(engine.isRunning, "Core not running")
         let runDirectories = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix("run-") }
@@ -128,7 +131,7 @@ enum SmokeChecks {
         } catch let error as ClientError {
             try check(error.localizedDescription.contains("已被占用"), "Wrong port conflict failure")
         }
-        // Only the test Shadowsocks server can resolve this host via its private fixture DNS.
+        // Only the test Shadowsocks server maps this synthetic address to the HTTP fixture.
         try TerminalProxyChecks.request(manager: terminal, corePID: engine.process!.processIdentifier, ports: ports, url: url)
         try curl(["--socks5-hostname", "127.0.0.1:\(socksPort)", url])
         try curl(["--proxy", "http://127.0.0.1:\(httpPort)", url])
@@ -136,13 +139,15 @@ enum SmokeChecks {
         let (probeData, _) = try await ConnectionProbe.request(url: URL(string: url)!, httpPort: httpPort)
         try check(String(decoding: probeData, as: UTF8.self) == "shadowbat-test-response", "App connection probe failed")
         try check(!logs.joined().contains(password), "Core logs leaked credentials")
-        print("PASS: signed bundled core; encrypted SOCKS5, HTTP, and CONNECT requests")
+        print("PASS: bundled sing-box; encrypted SOCKS5, HTTP, and CONNECT requests")
 
         // A request must fail after its Shadowsocks server is gone: no silent direct fallback.
         kill(serverPID, SIGTERM)
         try await Task.sleep(for: .milliseconds(300))
         try curl(["--socks5-hostname", "127.0.0.1:\(socksPort)", url], succeeds: false)
         try curl(["--proxy", "http://127.0.0.1:\(httpPort)", url], succeeds: false)
+        try curl(["--proxy", "http://127.0.0.1:\(httpPort)", "http://localhost:\(fixturePort)/"])
+        print("PASS: direct domain works while the proxy upstream is stopped")
         do {
             _ = try await ConnectionProbe.request(url: URL(string: url)!, httpPort: httpPort)
             throw ClientError.message("App connection probe bypassed stopped server")

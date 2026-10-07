@@ -31,6 +31,8 @@ final class ConnectionViewModel: ObservableObject {
     @Published private(set) var helperInstallation = ProxyHelperClient.InstallationState.notInstalled
     @Published private(set) var recoveryNeeded = false
     @Published private(set) var useTerminalProxy = false
+    @Published private(set) var useTun = false
+    var tunEnabled: Bool { state == .connected && engine.isTunRunning }
     @Published private(set) var terminalProxyEnabled = false
     @Published private(set) var terminalIntegrationInstalled = false
     @Published var useSystemProxy = false {
@@ -46,6 +48,8 @@ final class ConnectionViewModel: ObservableObject {
     @Published private(set) var testResult: String?
     @Published private(set) var networkAvailable = true
 
+    @Published private(set) var routingSettings: [String: Any] = ["defaultAction": "proxy", "rules": [[String: Any]]()]
+
     private var store: ProfileStore?
     private var instanceLock: InstanceLock?
     private let defaults: UserDefaults
@@ -56,6 +60,7 @@ final class ConnectionViewModel: ObservableObject {
     private var terminalProxy: TerminalProxyManager?
     private var connectionTask: Task<Void, Never>?
     private var disconnecting = false
+    private var disconnectTask: Task<Bool, Never>?
     private var proxyTask: Task<Void, Never>?
     private var exitRecoveryTask: Task<Void, Never>?
     private var appObserver: NSObjectProtocol?
@@ -76,13 +81,15 @@ final class ConnectionViewModel: ObservableObject {
         return "手动选择 · \(profiles.first { $0.id == manualID }?.name ?? "请选择节点")"
     }
     var systemProxySwitch: Bool { state == .connected ? systemProxyEnabled : useSystemProxy }
+    private var helperRefreshing = false
     var busy: Bool { state == .starting || state == .stopping || systemProxyBusy || exitRecoveryTask != nil }
     var ports: LocalPorts { LocalPorts(socks: socksPort, http: httpPort) }
     var terminalActivationCommand: String { terminalProxy?.activationCommand ?? "" }
     var canConnect: Bool { !candidates.isEmpty && !busy && state != .connected && !recoveryNeeded && store != nil && connectionTask == nil }
 
     init(directory: URL? = nil, defaults: UserDefaults = .standard, keychain: KeychainStore? = nil,
-         coreExecutable: URL? = nil, terminalManager: TerminalProxyManager? = nil, observeEnvironment: Bool = true) {
+         coreExecutable: URL? = nil, terminalManager: TerminalProxyManager? = nil, observeEnvironment: Bool = true,
+         proxyHelper: (any SystemProxyHelping)? = nil) {
         self.defaults = defaults
         self.keychain = keychain ?? KeychainStore()
         self.coreExecutable = coreExecutable
@@ -90,6 +97,7 @@ final class ConnectionViewModel: ObservableObject {
         manualID = defaults.string(forKey: "manualNodeID").flatMap(UUID.init(uuidString:))
         useSystemProxy = defaults.bool(forKey: "useSystemProxy")
         useTerminalProxy = defaults.bool(forKey: "useTerminalProxy")
+        useTun = defaults.bool(forKey: "useTun")
         socksPort = defaults.object(forKey: "socksPort") as? Int ?? 1081
         httpPort = defaults.object(forKey: "httpPort") as? Int ?? 1087
         do {
@@ -97,9 +105,23 @@ final class ConnectionViewModel: ObservableObject {
             instanceLock = try InstanceLock(directory: store.directory)
             self.store = store
             profiles = try store.load()
+            let routingURL = store.directory.appendingPathComponent("routing.json")
+            if FileManager.default.fileExists(atPath: routingURL.path) {
+                let original = try Data(contentsOf: routingURL)
+                guard let saved = try JSONSerialization.jsonObject(with: original) as? [String: Any] else { throw ClientError.message("直连配置无效。") }
+                routingSettings = try SingBoxConfiguration.directSettings(saved)
+                if !NSDictionary(dictionary: saved).isEqual(to: routingSettings) {
+                    let backup = store.directory.appendingPathComponent("routing-before-direct-config.json")
+                    if !FileManager.default.fileExists(atPath: backup.path) {
+                        try original.write(to: backup, options: .atomic)
+                        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+                    }
+                    try Self.persistRouting(routingSettings, at: routingURL)
+                }
+            }
             selectedID = profiles.first?.id
             if !profiles.contains(where: { $0.id == manualID }) { setManualNode(profiles.first?.id) }
-            let proxy = SystemProxyController(directory: store.directory)
+            let proxy = SystemProxyController(directory: store.directory, helper: proxyHelper ?? ProxyHelperClient())
             systemProxy = proxy
             let terminal = terminalManager ?? TerminalProxyManager(directory: store.directory)
             terminalProxy = terminal
@@ -116,14 +138,16 @@ final class ConnectionViewModel: ObservableObject {
         } catch { store = nil; errorMessage = "初始化失败：\(error.localizedDescription)" }
         engine.onLog = { [weak self] text in self?.log(text) }
         engine.onExit = { [weak self] status in self?.handleExit(status) }
-        guard observeEnvironment else { return }
         systemProxy?.helper.onConnectionLost = { [weak self] in
             guard let self else { return }
             self.systemProxyEnabled = false
             self.recoveryNeeded = self.systemProxy?.hasBackup == true
-            self.log("后台辅助程序连接已中断，正在检查系统代理恢复状态。")
-            Task { await self.refreshHelperInstallation() }
+            self.log("后台辅助程序连接已中断；请恢复系统代理后重试。")
+            // A rejected signature also invalidates XPC immediately. Reconnecting
+            // here creates an unbounded invalidation/refresh loop after updates.
+            // The next activation or explicit recovery performs one bounded check.
         }
+        guard observeEnvironment else { return }
         appObserver = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
                                                               object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in await self?.refreshHelperInstallation() }
@@ -164,6 +188,12 @@ final class ConnectionViewModel: ObservableObject {
     func setServiceEnabled(_ enabled: Bool) {
         if enabled { connect() }
         else if serviceEnabled { Task { await disconnect() } }
+    }
+
+    func setTun(_ enabled: Bool) throws {
+        guard canChangeSelection else { throw ClientError.message("请先关闭代理服务，再切换 TUN 隧道。") }
+        useTun = enabled
+        defaults.set(enabled, forKey: "useTun")
     }
 
     func setAutomaticParticipation(_ enabled: Bool, for profile: ServerProfile) {
@@ -214,6 +244,19 @@ final class ConnectionViewModel: ObservableObject {
         } catch { errorMessage = error.localizedDescription }
     }
 
+    private static func persistRouting(_ settings: [String: Any], at url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    func saveRouting(_ value: [String: Any]) throws {
+        guard canChangeSelection, let store else { throw ClientError.message("请先断开连接，再修改直连配置。") }
+        let settings = try SingBoxConfiguration.directSettings(value)
+        try Self.persistRouting(settings, at: store.directory.appendingPathComponent("routing.json"))
+        routingSettings = settings
+    }
+
     func connect() {
         guard canConnect, let store else { return }
         let candidates = candidates
@@ -230,13 +273,13 @@ final class ConnectionViewModel: ObservableObject {
                     return ProxyServer(profile: profile, password: password)
                 }
                 log("正在启动全局代理：\(connectionDescription)。")
-                try await engine.start(servers: servers, ports: ports, directory: store.directory, executable: coreExecutable)
+                try await engine.start(servers: servers, ports: ports, directory: store.directory, executable: coreExecutable, routing: routingSettings, tun: useTun)
                 try Task.checkCancellation()
                 if useSystemProxy { try await enableSystemProxy() }
                 try Task.checkCancellation()
                 if useTerminalProxy { try enableTerminalProxy() }
                 state = .connected
-                log("本地代理正在运行。可点击测试连接验证远端服务。")
+                log(useTun ? "TUN 隧道已启用，TCP / UDP 与 DNS 由虚拟网卡接管。" : "本地代理正在运行。可点击测试连接验证远端服务。")
             } catch {
                 disableTerminalProxy()
                 if systemProxy?.hasBackup == true {
@@ -256,7 +299,17 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     func disconnect() async -> Bool {
-        guard !disconnecting else { return false }
+        if let disconnectTask { return await disconnectTask.value }
+        let task = Task { @MainActor in
+            let result = await self.performDisconnect()
+            self.disconnectTask = nil
+            return result
+        }
+        disconnectTask = task
+        return await task.value
+    }
+
+    private func performDisconnect() async -> Bool {
         disconnecting = true
         defer { disconnecting = false }
         state = .stopping
@@ -304,11 +357,19 @@ final class ConnectionViewModel: ObservableObject {
 
     func recoverSystemProxy() {
         guard !busy else { return }
+        errorMessage = nil
         systemProxyBusy = true
         proxyTask = Task {
-            defer { systemProxyBusy = false; proxyTask = nil }
-            do { try await restoreSystemProxy() }
-            catch { errorMessage = error.localizedDescription }
+            defer {
+                helperInstallation = systemProxy?.helper.installation ?? .notInstalled
+                systemProxyBusy = false
+                proxyTask = nil
+            }
+            do { try await restoreSystemProxy(repairUnavailable: true); errorMessage = nil }
+            catch {
+                recoveryNeeded = systemProxy?.hasBackup == true
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -329,9 +390,11 @@ final class ConnectionViewModel: ObservableObject {
     func openHelperApprovalSettings() { systemProxy?.helper.openApprovalSettings() }
 
     func refreshHelperInstallation() async {
-        guard let systemProxy else { return }
+        guard let systemProxy, !helperRefreshing else { return }
         helperInstallation = systemProxy.helper.installation
         guard helperInstallation == .ready, !systemProxyBusy, !disconnecting, state != .starting else { return }
+        helperRefreshing = true
+        defer { helperRefreshing = false }
         do {
             try await systemProxy.refresh()
             if !systemProxyEnabled { recoveryNeeded = systemProxy.hasBackup }
@@ -391,11 +454,11 @@ final class ConnectionViewModel: ObservableObject {
         log("系统代理已开启：\(services.joined(separator: "、"))。")
     }
 
-    private func restoreSystemProxy() async throws {
+    private func restoreSystemProxy(repairUnavailable: Bool = false) async throws {
         guard let systemProxy, systemProxy.hasBackup else {
             systemProxyEnabled = false; recoveryNeeded = false; return
         }
-        let skipped = try await systemProxy.restore()
+        let skipped = try await systemProxy.restore(repairUnavailable: repairUnavailable)
         systemProxyEnabled = false
         recoveryNeeded = false
         if skipped.isEmpty { log("已恢复原系统代理设置。") }

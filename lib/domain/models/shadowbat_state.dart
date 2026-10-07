@@ -1,3 +1,5 @@
+import '../routing/routing_settings.dart';
+
 class ServerProfile {
   const ServerProfile({
     required this.id,
@@ -73,6 +75,9 @@ class ShadowbatState {
   String? get testResult => _values['testResult'] as String?;
   int get socksPort => _values['socksPort'] as int? ?? 1081;
   int get httpPort => _values['httpPort'] as int? ?? 1087;
+  RoutingSettings get routing => RoutingSettings.fromMap(
+    Map<String, dynamic>.from(_values['routing'] as Map? ?? {}),
+  );
   bool get busy => _flag('busy');
   bool get serviceEnabled => _flag('serviceEnabled');
   bool get serviceUnavailable => _flag('serviceUnavailable');

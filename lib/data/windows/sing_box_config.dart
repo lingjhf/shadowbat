@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import '../../domain/models/shadowbat_state.dart';
+import '../../domain/routing/routing_settings.dart';
+import '../routing/sing_box_routing.dart';
 
 Map<String, Object?> profileMap(ServerProfile p) => {
   'id': p.id,
@@ -42,6 +44,7 @@ Map<String, Object?> singBoxConfig({
   required int socksPort,
   required int httpPort,
   required bool tun,
+  RoutingSettings routing = const RoutingSettings(),
   String testURL = 'https://www.apple.com/library/test/success.html',
 }) {
   if (profiles.isEmpty) throw StateError('请启用至少一个候选节点或选择固定节点。');
@@ -51,19 +54,7 @@ Map<String, Object?> singBoxConfig({
   }
   return {
     'log': {'level': 'info', 'timestamp': true},
-    'dns': {
-      'servers': [
-        {'type': 'local', 'tag': 'bootstrap'},
-        {
-          'type': 'https',
-          'tag': 'remote-dns',
-          'server': '1.1.1.1',
-          'detour': 'proxy',
-        },
-      ],
-      'final': 'remote-dns',
-      'strategy': 'prefer_ipv4',
-    },
+    ...singBoxRouting(routing, tun: tun),
     'inbounds': [
       {
         'type': 'socks',
@@ -87,19 +78,11 @@ Map<String, Object?> singBoxConfig({
           'auto_route': true,
           'strict_route': true,
           'stack': 'mixed',
-          'route_exclude_address': [
-            '127.0.0.0/8',
-            '10.0.0.0/8',
-            '172.16.0.0/12',
-            '192.168.0.0/16',
-            '169.254.0.0/16',
-            '::1/128',
-            'fc00::/7',
-            'fe80::/10',
-          ],
+          'route_exclude_address': reservedNetworks,
         },
     ],
     'outbounds': [
+      {'type': 'direct', 'tag': 'direct'},
       if (tags.length > 1)
         {
           'type': 'urltest',
@@ -122,13 +105,5 @@ Map<String, Object?> singBoxConfig({
           'password': passwords[p.id],
         },
     ],
-    'route': {
-      'auto_detect_interface': true,
-      'default_domain_resolver': 'bootstrap',
-      'rules': [
-        if (tun) {'protocol': 'dns', 'action': 'hijack-dns'},
-      ],
-      'final': 'proxy',
-    },
   };
 }

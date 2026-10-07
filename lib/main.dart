@@ -10,9 +10,14 @@ import 'data/windows/windows_platform.dart';
 import 'data/windows/windows_repository.dart';
 import 'data/windows/windows_self_test.dart';
 import 'ui/shadowbat_view_model.dart';
+import 'ui/tray_panel.dart';
 
 void main(List<String> arguments) {
   WidgetsFlutterBinding.ensureInitialized();
+  if (arguments.contains('--tray-panel')) {
+    runApp(const NativeTrayApp());
+    return;
+  }
   if (!kIsWeb &&
       defaultTargetPlatform == TargetPlatform.windows &&
       arguments.contains('--self-test')) {

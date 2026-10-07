@@ -1,3 +1,6 @@
+import '../../domain/routing/routing_settings.dart';
+import '../services/routing_resolver.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -29,6 +32,7 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
   final _events = StreamController<ShadowbatState>.broadcast();
   final _random = Random.secure();
   final _logs = <Map<String, dynamic>>[];
+  RoutingSettings _routing = const RoutingSettings();
   final _preferences = <String, Object?>{};
   List<ServerProfile> _profiles = [];
   List<String> _activeIDs = [];
@@ -42,6 +46,7 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
   int _logOffset = 0, _generation = 0;
   Timer? _timer;
   Future<void>? _initializing;
+  Future<Object?>? _quitting;
   final String probeURL;
   String get _mode => _preferences['selectionMode'] as String? ?? 'automatic';
   String? get _manualID => _preferences['manualID'] as String?;
@@ -89,6 +94,21 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
         ),
       );
     }
+    if (await _file('routing.json').exists()) {
+      final saved = Map<String, dynamic>.from(
+        jsonDecode(await _file('routing.json').readAsString()) as Map,
+      );
+      final legacy = RoutingSettings.fromMap(saved);
+      _routing = legacy.directOnly();
+      if (legacy.defaultAction != RouteAction.proxy ||
+          legacy.rules.length != _routing.rules.length) {
+        if (!await _file('routing-before-direct-config.json').exists()) {
+          await _write('routing-before-direct-config.json', saved);
+        }
+        await _write('routing.json', _routing.toMap());
+        _log('已迁移直连配置：公网默认代理，保留 ${_routing.rules.length} 条直连配置；原设置已备份。');
+      }
+    }
     if (!_profiles.any((v) => v.id == _manualID)) {
       _preferences['manualID'] = _profiles.firstOrNull?.id;
     }
@@ -113,6 +133,7 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
 
   ShadowbatState snapshot() => ShadowbatState({
     'platform': 'windows',
+    'routing': _routing.toMap(),
     'profiles': _profiles.map(profileMap).toList(),
     'selectedID': _selectedID,
     'manualID': _manualID,
@@ -170,16 +191,20 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
       platform
           .invoke('updateTray', {
             'stateLabel': state.stateLabel,
+            'state': state.state,
             'serviceEnabled': _enabled,
             'systemProxy': state.systemProxySwitch,
             'terminalProxy': _flag('useTerminalProxy'),
             'useTun': _flag('useTun'),
             'busy': _busy,
-            'canConnect': state.serviceUnavailable == false,
+            'serviceUnavailable': state.serviceUnavailable,
+            'canChangeSelection': state.canChangeSelection,
+            'connectionDescription': state.description,
             'selectionMode': _mode,
             'manualID': _manualID,
             'profiles': _profiles.map(profileMap).toList(),
             'recoveryNeeded': _recovery,
+            'errorMessage': state.error,
           })
           .catchError((Object _) => null),
     );
@@ -214,6 +239,10 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
   Future<void> _commandQueue = Future<void>.value();
   @override
   Future<Object?> command(String name, [Map<String, Object?>? arguments]) {
+    if (name == 'quit') return _quitting ??= _requestQuit();
+    if (_quitting != null && name != 'snapshot') {
+      return Future<Object?>.error(StateError('应用正在退出。'));
+    }
     if ([
       'snapshot',
       'password',
@@ -221,6 +250,7 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
       'dismissError',
       'clearLogs',
       'testConnection',
+      'resolveRoutingTarget',
     ].contains(name)) {
       return _executeCommand(name, arguments);
     }
@@ -230,6 +260,26 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
       onError: (Object _, StackTrace _) {},
     );
     return work;
+  }
+
+  Future<Object?> _requestQuit() async {
+    _timer?.cancel();
+    try {
+      // This UI-only native operation must precede queued connection/cleanup work.
+      await platform.invoke('beginShutdown');
+      await _commandQueue;
+      return await _executeCommand('quit');
+    } catch (_) {
+      _quitting = null;
+      await platform.invoke('cancelShutdown');
+      if (!_closed && _state == 'connected') {
+        _timer = Timer.periodic(
+          const Duration(milliseconds: 300),
+          (_) => unawaited(_poll()),
+        );
+      }
+      rethrow;
+    }
   }
 
   Future<Object?> _executeCommand(
@@ -242,6 +292,15 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
       switch (name) {
         case 'snapshot':
           return snapshot();
+        case 'resolveRoutingTarget':
+          return await resolveRoutingTarget(args['target'] as String);
+        case 'saveRouting':
+          _editable();
+          final policy = RoutingSettings.fromMap(
+            Map<String, dynamic>.from(args),
+          ).directOnly();
+          await _write('routing.json', policy.toMap());
+          _routing = policy;
         case 'setService':
           if (_busy) return null;
           if (args['value'] == true) {
@@ -430,6 +489,7 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
         socksPort: _socks,
         httpPort: _http,
         tun: _flag('useTun'),
+        routing: _routing,
         testURL: probeURL,
       );
       await _write('run.json', config);
@@ -581,7 +641,7 @@ class WindowsShadowbatRepository implements ShadowbatRepository {
   }
 
   Future<void> _poll() async {
-    if (_polling || _closed) return;
+    if (_polling || _closed || _quitting != null) return;
     _polling = true;
     try {
       await _readCoreLogs();

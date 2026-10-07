@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='shadowbat-sync-') as temporary:
             relative = file.relative_to(ROOT)
             if any(part in EXCLUDE for part in relative.parts) or file.is_symlink() or not file.is_file():
                 continue
-            if '--source-only' in sys.argv and (file.suffix.lower() in {'.exe', '.dll'} or relative.as_posix() == 'macos/Tools/sslocal'):
+            if '--source-only' in sys.argv and (file.suffix.lower() in {'.exe', '.dll'} or relative.as_posix() in {'macos/Tools/sslocal', 'macos/Tools/sing-box'}):
                 continue
             tar.add(file, arcname=relative.as_posix(), recursive=False)
     subprocess.run(['scp', '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3', str(archive), 'windows:D:/workspace/' + name], check=True)
