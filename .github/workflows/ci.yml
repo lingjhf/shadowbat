@@ -35,15 +35,16 @@ jobs:
       - run: flutter pub get --enforce-lockfile
       - run: dart format --output=none --set-exit-if-changed lib test
       - run: flutter analyze --fatal-infos
+      - run: python3 scripts/test-version.py
       - name: Validate version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: |
           if [[ "$REF_TYPE" == tag ]]; then
-            python3 scripts/check-version.py --tag "$RELEASE_TAG"
+            python3 scripts/check-version.py --check-changelog --tag "$RELEASE_TAG"
           else
-            python3 scripts/check-version.py
+            python3 scripts/check-version.py --check-changelog
           fi
 
   test:
@@ -179,7 +180,7 @@ jobs:
       - name: Validate tag and main ancestry
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: python3 scripts/check-version.py --tag "$RELEASE_TAG" --require-main
+        run: python3 scripts/check-version.py --check-changelog --tag "$RELEASE_TAG" --require-main
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets

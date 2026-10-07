@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Align GitHub main and version-tag protection with cutdex_agent: require up-to-date PRs and CI, restrict tag creation to administrators, and prohibit tag changes or deletion.
+- Track repository rulesets and provide an idempotent administrator tool to apply or verify the remote policies.
+- Validate complete Flutter versions, SemVer prerelease identifiers, matching release tags and changelog headings in CI, with release metadata regression checks.
+
 ## 1.3.8+16
 
 - Stop recursive XPC reconnection after helper rejection or invalidation during macOS app replacement.

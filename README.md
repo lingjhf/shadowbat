@@ -172,16 +172,33 @@ powershell -ExecutionPolicy Bypass -File scripts/test-windows-interactive.ps1 -D
 
 ## Git、分支与版本发布
 
-远程仓库为 `git@github.com:lingjhf/shadowbat.git`。沿用 `cutdex_agent` 的 `main` 主分支与 `v*` 标签发布方式：日常改动在功能分支完成并提交到 `main`；`pubspec.yaml` 是应用版本的唯一来源，当前为 `1.3.8+16`。`+16` 是 Flutter 构建号，发布标签需完整匹配 `v1.3.8+16`。
+远程仓库为 `git@github.com:lingjhf/shadowbat.git`。沿用 `cutdex_agent` 的 `main` 主分支与 `v*` 标签发布方式：日常改动在 `codex/<功能名称>` 等功能分支完成，通过 PR 合并到 `main`。`pubspec.yaml` 是应用版本的唯一来源，当前为 `1.3.8+16`。`+16` 是 Flutter 构建号，发布标签需完整匹配 `v1.3.8+16`。
 
-CI 在指向 `main` 的 PR、`main` 推送、`v*` 标签推送及手动触发时运行，固定使用 Flutter 3.47.5。它检查格式、静态分析和版本，执行 Linux/Windows/macOS 的 Flutter 测试，构建 Windows x64 与 macOS arm64，并生成 macOS DMG、Windows EXE 安装包和便携 ZIP，以及 SHA-256 文件。工作流 Action 固定到提交 SHA；Dependabot 每周检查 Action 更新。汇总检查名为 `CI passed`，可设为主分支必过检查。
+CI 在指向 `main` 的 PR、`main` 推送、`v*` 标签推送及手动触发时运行，固定使用 Flutter 3.47.5。它检查格式、静态分析、版本格式与对应 CHANGELOG 条目，执行 Linux/Windows/macOS 的 Flutter 测试，构建 Windows x64 与 macOS arm64，并生成 macOS DMG、Windows EXE 安装包和便携 ZIP，以及 SHA-256 文件。工作流 Action 固定到提交 SHA；Dependabot 每周检查 Action 更新。汇总检查名为 `CI passed`，已设置为 main 的必过检查。
 
-发布时先更新 `pubspec.yaml` 和 `CHANGELOG.md`，将代码合并到 `main`，然后从对应提交创建标签：
+仓库使用与参考项目一致的 GitHub Rulesets，规则定义保存在 `.github/rulesets`：
+
+- [Protect main](https://github.com/lingjhf/shadowbat/rules/24641125)：禁止删除、强制推送和直接推送，必须通过 PR；合并前分支必须跟上 main，所有 CI 必须成功，评审讨论必须解决。没有管理员绕过权限；与参考项目一致，不强制要求其他人批准个人仓库的 PR。
+- [Version tags: administrators create](https://github.com/lingjhf/shadowbat/rules/24641162)：`v*` 标签只能由仓库管理员创建。
+- [Version tags: prevent changes](https://github.com/lingjhf/shadowbat/rules/24641164)：已有 `v*` 标签禁止修改或删除，管理员也不能绕过。
+
+使用已登录的 GitHub CLI 校验远程配置；只有明确修改保护策略时才使用 `--apply`，它会按规则名称更新现有规则，避免重复创建：
 
 ```sh
-python3 scripts/check-version.py
-git tag -a v1.3.8+16 -m 'Shadowbat 1.3.8+16'
-git push origin v1.3.8+16
+python3 scripts/repository-rules.py
+python3 scripts/repository-rules.py --apply
+```
+
+版本格式为 `MAJOR.MINOR.PATCH[-prerelease]+BUILD`，预发布标识遵循 SemVer，构建号为正整数。发布应用变更时递增构建号，并同步更新 `CHANGELOG.md` 中的 `## <完整版本>` 条目；仅维护 CI、文档或仓库规则时可以保留应用版本。已发布的版本标签不能重复使用，例如下一次修复版本可以使用 `1.3.9+17`。
+
+发布时先更新 `pubspec.yaml` 和 `CHANGELOG.md`，将代码通过 PR 合并到 `main`，再同步本地 main 并由管理员从对应提交创建标签：
+
+```sh
+git switch main
+git pull --ff-only origin main
+version=$(python3 scripts/check-version.py --check-changelog --require-main)
+git tag -a "v$version" -m "Shadowbat $version"
+git push origin "v$version"
 ```
 
 标签触发完整 CI，通过后检查标签与版本一致、提交属于 `main`，再创建 GitHub Release 并上传 macOS DMG、Windows EXE 安装包、便携 ZIP 与校验文件。带预发布后缀（如 `1.1.0-beta.1+2`）的标签发布为 prerelease。应用保持 `publish_to: none`，不会发布到 pub.dev。
