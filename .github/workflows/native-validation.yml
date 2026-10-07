@@ -24,5 +24,14 @@ jobs:
           persist-credentials: false
       - name: Install local Shadowsocks fixture server
         run: brew install shadowsocks-rust
+      - run: sh scripts/prepare-core.sh
       - run: python3 scripts/test-helper.py
+      - run: python3 scripts/test-macos-proxy-recovery.py
       - run: python3 scripts/test-local.py
+      - run: python3 scripts/test-macos-port-cleanup.py
+      - run: python3 scripts/test-macos-quit.py
+      - run: python3 scripts/test-macos-tray-position.py
+      - name: Prepare native TUN configuration
+        run: python3 scripts/test-macos-tun.py --prepare
+      - name: Validate isolated utun forwarding and cleanup
+        run: sudo /usr/bin/python3 scripts/test-macos-tun.py

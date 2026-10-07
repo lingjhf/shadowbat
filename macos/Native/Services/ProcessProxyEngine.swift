@@ -3,6 +3,19 @@ import Darwin
 
 @MainActor
 final class ProcessProxyEngine {
+    let probeURL: String
+    let probeInterval: String
+    let testAPIPort: Int?
+    private let tunAuthorizer: PrivilegedTunClient.Authorizer?
+    private let tunConfiguration: (([String: Any]) -> [String: Any])?
+    init(probeURL: String = "https://www.apple.com/library/test/success.html", probeInterval: String = "1m", testAPIPort: Int? = nil,
+         tunAuthorizer: PrivilegedTunClient.Authorizer? = nil, tunConfiguration: (([String: Any]) -> [String: Any])? = nil) {
+        self.probeURL = probeURL
+        self.probeInterval = probeInterval
+        self.testAPIPort = testAPIPort
+        self.tunAuthorizer = tunAuthorizer
+        self.tunConfiguration = tunConfiguration
+    }
     var onLog: ((String) -> Void)?
     var onExit: ((Int32) -> Void)?
     private(set) var process: Process?
@@ -10,25 +23,40 @@ final class ProcessProxyEngine {
     private var runDirectory: URL?
     private var secrets: [String] = []
     private var logBuffer = ""
+    private var privileged: PrivilegedTunClient?
+    private var shutdownTask: Task<Void, Never>?
 
     var isRunning: Bool { process?.isRunning == true }
+    var isTunRunning: Bool { isRunning && privileged?.started == true }
+    var actualCorePID: Int32? { privileged?.corePID ?? process?.processIdentifier }
+    var supervisorPID: Int32? { privileged?.supervisorPID }
 
     func start(profile: ServerProfile, password: String, ports: LocalPorts, directory: URL,
-               executable: URL? = nil) async throws {
+               executable: URL? = nil, routing: [String: Any] = [:], tun: Bool = false, tunHelper: URL? = nil) async throws {
         try await start(servers: [ProxyServer(profile: profile, password: password)], ports: ports,
-                        directory: directory, executable: executable)
+                        directory: directory, executable: executable, routing: routing, tun: tun, tunHelper: tunHelper)
     }
 
     func start(servers: [ProxyServer], ports: LocalPorts, directory: URL,
-               executable: URL? = nil) async throws {
+               executable: URL? = nil, routing: [String: Any] = [:], tun: Bool = false, tunHelper: URL? = nil) async throws {
+        if let shutdownTask { await shutdownTask.value }
         guard process == nil else { throw ClientError.message("代理内核已启动。") }
         guard !servers.isEmpty else { throw ClientError.message("请添加或启用至少一个候选节点。") }
         for server in servers { try server.profile.validate(password: server.password) }
         try ports.validate()
-        for port in [ports.socks, ports.http] { try Self.checkAvailable(port) }
+        // A previous crashed app's watchdog may still be releasing its sockets.
+        // Never stop an unknown listener; retry briefly, then report the conflict.
+        try await Self.waitForAvailablePorts(ports, tun: tun)
+        guard process == nil else { throw ClientError.message("代理内核已启动。") }
         guard let executable = executable ?? Bundle.main.executableURL?.deletingLastPathComponent()
-            .appendingPathComponent("sslocal"), FileManager.default.isExecutableFile(atPath: executable.path) else {
-            throw ClientError.message("App 中缺少 sslocal，请运行 scripts/prepare-core.sh 后重新构建。")
+            .appendingPathComponent("sing-box"), FileManager.default.isExecutableFile(atPath: executable.path) else {
+            throw ClientError.message("App 中缺少 sing-box，请运行 scripts/prepare-core.sh 后重新构建。")
+        }
+        var configuration = try SingBoxConfiguration.make(servers: servers, ports: ports, settings: routing,
+                                                           probeURL: probeURL, interval: probeInterval, tun: tun)
+        if tun, let tunConfiguration { configuration = tunConfiguration(configuration) }
+        if let testAPIPort {
+            configuration["experimental"] = ["clash_api": ["external_controller": "127.0.0.1:\(testAPIPort)"]]
         }
         let folder = directory.appendingPathComponent("run-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
@@ -38,17 +66,6 @@ final class ProcessProxyEngine {
             [server.password, Data(server.password.utf8).base64EncodedString(),
              Data("\(server.profile.method):\(server.password)".utf8).base64EncodedString()]
         }.sorted { $0.count > $1.count }
-        let configuration: [String: Any] = [
-            "servers": servers.map { server in
-                ["server": server.profile.host, "server_port": server.profile.port,
-                 "method": server.profile.method, "password": server.password, "mode": "tcp_and_udp"] as [String: Any]
-            },
-            "balancer": ["max_server_rtt": 5, "check_interval": 10, "check_best_interval": 5],
-            "locals": [
-                ["local_address": "127.0.0.1", "local_port": ports.socks, "protocol": "socks", "mode": "tcp_and_udp"],
-                ["local_address": "127.0.0.1", "local_port": ports.http, "protocol": "http", "mode": "tcp_only"]
-            ]
-        ]
         do {
             let configURL = folder.appendingPathComponent("config.json")
             let data = try JSONSerialization.data(withJSONObject: configuration)
@@ -57,17 +74,21 @@ final class ProcessProxyEngine {
                 throw ClientError.message("无法创建内核配置。")
             }
             let output = Pipe()
-            let child = Process()
-            child.executableURL = executable
-            child.arguments = ["-c", configURL.path, "--log-without-time", "-vv"]
+            if tun {
+                privileged = try PrivilegedTunClient(helper: tunHelper ?? executable.deletingLastPathComponent().appendingPathComponent("shadowbat-proxy-helper"), authorizer: tunAuthorizer)
+                privileged?.onLog = { [weak self] in self?.receive($0) }
+            }
+            let child = privileged?.launcher ?? Process()
+            if !tun {
+                child.executableURL = executable
+                child.arguments = ["run", "-c", configURL.path]
+                child.standardInput = FileHandle.nullDevice
+            }
             child.standardOutput = output
             child.standardError = output
-            child.standardInput = FileHandle.nullDevice
             // A small watchdog prevents an orphaned proxy if the host app crashes.
             let parentPID = getpid()
             child.environment = ProcessInfo.processInfo.environment
-            // Keep node-selection events visible at the app's chosen log level.
-            child.environment?.removeValue(forKey: "RUST_LOG")
             output.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
@@ -80,7 +101,7 @@ final class ProcessProxyEngine {
             child.terminationHandler = { [weak self] child in
                 let status = child.terminationStatus
                 Task { @MainActor [weak self] in
-                    guard let self, self.process === child else { return }
+                    guard let self, self.process === child, self.shutdownTask == nil else { return }
                     self.cleanup()
                     self.onExit?(status)
                 }
@@ -88,12 +109,17 @@ final class ProcessProxyEngine {
             pipe = output
             process = child
             try child.run()
-            Self.startWatchdog(childPID: child.processIdentifier, parentPID: parentPID, directory: folder)
-            // Initial probes run before listeners start when there are multiple nodes.
+            Self.startWatchdog(childPID: child.processIdentifier, parentPID: parentPID, directory: folder,
+                               tunDirectory: privileged?.watchdogDirectory)
+            if let privileged {
+                onLog?("正在等待 macOS 管理员授权，以创建 TUN 隧道。")
+                try await privileged.connect(configuration: configuration)
+            }
+            // Wait asynchronously for both local listeners to accept connections.
             for _ in 0..<300 {
                 try Task.checkCancellation()
                 guard child.isRunning else { throw ClientError.message("代理内核启动失败，请检查日志。") }
-                if Self.socksReady(ports.socks), Self.canConnect(ports.http) {
+                if Self.socksReady(ports.socks), Self.canConnect(ports.http), !tun || privileged?.started == true {
                     onLog?("本地监听已就绪：SOCKS5 \(ports.socks)，HTTP \(ports.http)。")
                     return
                 }
@@ -107,26 +133,77 @@ final class ProcessProxyEngine {
     }
 
     func stop() async {
+        if let shutdownTask { await shutdownTask.value; return }
         guard let child = process else { cleanup(); return }
+        // An unstructured task owns cleanup independently of a cancelled start.
+        // Concurrent disconnects must all await the same actual process exit.
+        let task = Task { @MainActor in
+            await self.stopChild(child)
+            self.shutdownTask = nil
+        }
+        shutdownTask = task
+        await task.value
+    }
+
+    private func stopChild(_ child: Process) async {
         child.terminationHandler = nil
+        let wasTun = privileged?.hasSession == true
+        privileged?.closeControl()
+        if wasTun && child.isRunning {
+            for _ in 0..<160 {
+                if !child.isRunning { break }
+                await Self.cleanupPause()
+            }
+        }
         if child.isRunning {
             child.terminate()
             for _ in 0..<40 {
                 if !child.isRunning { break }
-                try? await Task.sleep(for: .milliseconds(50))
+                await Self.cleanupPause()
             }
             if child.isRunning {
                 kill(child.processIdentifier, SIGKILL)
-                for _ in 0..<20 {
-                    if !child.isRunning { break }
-                    try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+        if child.processIdentifier > 0 {
+            // Reap off the UI thread before publishing "disconnected" or
+            // allowing another core to bind the same ports.
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().async {
+                    child.waitUntilExit()
+                    continuation.resume()
                 }
             }
         }
         cleanup()
     }
 
+    private static func cleanupPause() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) {
+                continuation.resume()
+            }
+        }
+    }
+
+    private static func waitForAvailablePorts(_ ports: LocalPorts, tun: Bool) async throws {
+        // The root TUN watchdog has a five-second graceful shutdown budget.
+        let attempts = tun ? 160 : 60
+        for attempt in 0...attempts {
+            try Task.checkCancellation()
+            do {
+                for port in [ports.socks, ports.http] { try checkAvailable(port) }
+                return
+            } catch {
+                if attempt == attempts { throw error }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
     private func cleanup() {
+        privileged?.closeControl()
+        privileged = nil
         pipe?.fileHandleForReading.readabilityHandler = nil
         if !logBuffer.isEmpty { emit(logBuffer) }
         logBuffer = ""
@@ -208,14 +285,132 @@ final class ProcessProxyEngine {
         return count == 2 && reply == [5, 0]
     }
 
-    private static func startWatchdog(childPID: Int32, parentPID: Int32, directory: URL) {
+    private static func startWatchdog(childPID: Int32, parentPID: Int32, directory: URL, tunDirectory: URL?) {
         // The detached watcher exits with either process; it has no credentials or config contents.
         let watcher = Process()
         watcher.executableURL = URL(fileURLWithPath: "/bin/sh")
-        watcher.arguments = ["-c", "while kill -0 \"$1\" 2>/dev/null && kill -0 \"$2\" 2>/dev/null; do sleep 1; done; if ! kill -0 \"$1\" 2>/dev/null; then kill -TERM \"$2\" 2>/dev/null; /bin/rm -rf -- \"$3\"; fi", "shadowbat-watchdog", String(parentPID), String(childPID), directory.path]
+        // Verify the unique configuration path before signalling, including
+        // after the grace period, to avoid targeting a reused process ID.
+        let script = """
+        owned() {
+          kill -0 "$2" 2>/dev/null || return 1
+          case "$(/bin/ps -ww -p "$2" -o command=)" in
+            *"$3/config.json"*) return 0 ;;
+            *"$4/control.sock"*) [ -n "$4" ] ;;
+            *) return 1 ;;
+          esac
+        }
+        while kill -0 "$1" 2>/dev/null && kill -0 "$2" 2>/dev/null; do sleep 0.2; done
+        if ! kill -0 "$1" 2>/dev/null && owned "$@"; then
+          kill -TERM "$2" 2>/dev/null
+          count=0
+          while owned "$@" && [ "$count" -lt 10 ]; do sleep 0.2; count=$((count + 1)); done
+          if owned "$@"; then kill -KILL "$2" 2>/dev/null; fi
+        fi
+        /bin/rm -rf -- "$3"
+        if [ -n "$4" ]; then /bin/rm -rf -- "$4"; fi
+        """
+        watcher.arguments = ["-c", script, "shadowbat-watchdog", String(parentPID), String(childPID), directory.path,
+                             tunDirectory?.path ?? ""]
         watcher.standardInput = FileHandle.nullDevice
         watcher.standardOutput = FileHandle.nullDevice
         watcher.standardError = FileHandle.nullDevice
         try? watcher.run()
+    }
+}
+
+/// macOS native tray and Flutter share a direct-only policy and one core.
+enum SingBoxConfiguration {
+    static let reserved = ["127.0.0.0/8", "169.254.0.0/16", "::1/128", "fe80::/10"]
+    static let privateNetworks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+    static func directSettings(_ value: [String: Any]) throws -> [String: Any] {
+        let defaultAction = value["defaultAction"] as? String ?? "proxy"
+        guard value["defaultAction"] == nil || value["defaultAction"] is String,
+              ["direct", "proxy"].contains(defaultAction),
+              let rules = value["rules"] as? [[String: Any]] ?? (value["rules"] == nil ? [] : nil), rules.count <= 1000 else {
+            throw ClientError.message("直连配置无效，最多支持 1000 条目标。")
+        }
+        var ids = Set<String>()
+        var direct: [[String: Any]] = []
+        for rule in rules {
+            guard let id = rule["id"] as? String, !id.isEmpty, id.count <= 100, ids.insert(id).inserted,
+                  let type = rule["type"] as? String, ["domain", "suffix", "ip", "cidr"].contains(type),
+                  let raw = rule["target"] as? String,
+                  let action = rule["action"] as? String, ["direct", "proxy"].contains(action),
+                  rule["enabled"] == nil || rule["enabled"] is Bool else { throw ClientError.message("直连目标信息不完整。") }
+            var target = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch type {
+            case "domain", "suffix":
+                target = target.lowercased()
+                if target.hasSuffix(".") { target.removeLast() }
+                guard !target.isEmpty, target.count <= 253, !isIP(target),
+                      target.split(separator: ".", omittingEmptySubsequences: false).allSatisfy({
+                        $0.range(of: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", options: .regularExpression) != nil
+                      }) else { throw ClientError.message("请填写有效域名，不含协议、路径或通配符。") }
+            case "ip":
+                guard isIP(target) else { throw ClientError.message("请填写有效 IPv4 或 IPv6 地址。") }
+            default:
+                let parts = target.split(separator: "/", omittingEmptySubsequences: false)
+                guard parts.count == 2, isIP(String(parts[0])),
+                      parts[1].range(of: "^[0-9]{1,3}$", options: .regularExpression) != nil, let bits = Int(parts[1]), bits >= 0,
+                      bits <= (parts[0].contains(":") ? 128 : 32) else { throw ClientError.message("请填写有效 IP 网段。") }
+            }
+            if action == "direct" {
+                direct.append(["id": id, "type": type, "target": target, "action": "direct", "enabled": rule["enabled"] as? Bool ?? true])
+            }
+        }
+        return ["defaultAction": "proxy", "rules": direct]
+    }
+    private static func isIP(_ value: String) -> Bool {
+        var v4 = in_addr(), v6 = in6_addr()
+        return value.withCString { inet_pton(AF_INET, $0, &v4) == 1 || inet_pton(AF_INET6, $0, &v6) == 1 }
+    }
+    static func make(servers: [ProxyServer], ports: LocalPorts, settings: [String: Any],
+                     probeURL: String, interval: String, tun: Bool = false) throws -> [String: Any] {
+        guard !servers.isEmpty else { throw ClientError.message("请添加至少一个节点。") }
+        let rules = (try directSettings(settings)["rules"] as! [[String: Any]]).filter { $0["enabled"] as? Bool == true }
+        var route: [[String: Any]] = tun ? [["action": "sniff"], ["protocol": "dns", "action": "hijack-dns"]] : []
+        route.append(["ip_cidr": reserved, "action": "route", "outbound": "direct"])
+        var dnsRules: [[String: Any]] = []
+        var resolved = false
+        for rule in rules {
+            let type = rule["type"] as! String, target = rule["target"] as! String
+            if !resolved && ["ip", "cidr"].contains(type) { route.append(["action": "resolve"]); resolved = true }
+            let match: [String: Any]
+            switch type {
+            case "domain": match = ["domain": [target]]
+            case "suffix": match = ["domain_suffix": [target]]
+            case "ip": match = ["ip_cidr": [target + (target.contains(":") ? "/128" : "/32")]]
+            default: match = ["ip_cidr": [target]]
+            }
+            route.append(match.merging(["action": "route", "outbound": "direct"]) { _, new in new })
+            if ["domain", "suffix"].contains(type) {
+                dnsRules.append(match.merging(["action": "route", "server": "bootstrap"]) { _, new in new })
+            }
+        }
+        if !resolved { route.append(["action": "resolve"]) }
+        route.append(["ip_cidr": privateNetworks, "action": "route", "outbound": "direct"])
+        let tags = servers.map { "node-\($0.profile.id.uuidString)" }
+        var outbounds: [[String: Any]] = [["type": "direct", "tag": "direct"]]
+        if servers.count > 1 {
+            outbounds.append(["type": "urltest", "tag": "proxy", "outbounds": tags, "url": probeURL, "interval": interval,
+                              "tolerance": 50, "interrupt_exist_connections": false])
+        } else { outbounds.append(["type": "selector", "tag": "proxy", "outbounds": tags]) }
+        outbounds += servers.map { ["type": "shadowsocks", "tag": "node-\($0.profile.id.uuidString)",
+                                    "server": $0.profile.host, "server_port": $0.profile.port,
+                                    "method": $0.profile.method, "password": $0.password] }
+        var inbounds: [[String: Any]] = [["type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": ports.socks],
+                                       ["type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": ports.http]]
+        if tun {
+            inbounds.append(["type": "tun", "tag": "tun-in", "address": ["172.29.254.1/30", "fdfe:29:fffe::1/126"], "mtu": 1500,
+                             "auto_route": true, "route_exclude_address": reserved, "stack": "system", "dns_mode": "hijack"])
+        }
+        return ["log": ["level": "info", "timestamp": true],
+                "dns": ["reverse_mapping": true, "servers": [["type": "local", "tag": "bootstrap"],
+                        ["type": "https", "tag": "remote-dns", "server": "1.1.1.1", "detour": "proxy"]],
+                        "rules": dnsRules, "final": "remote-dns", "strategy": "prefer_ipv4"],
+                "route": ["auto_detect_interface": true, "default_domain_resolver": "bootstrap", "rules": route, "final": "proxy"],
+                "inbounds": inbounds,
+                "outbounds": outbounds]
     }
 }

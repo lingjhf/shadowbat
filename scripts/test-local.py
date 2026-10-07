@@ -102,7 +102,7 @@ class OutboundServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 def main():
-    core = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / 'Tools/sslocal'
+    core = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / 'Tools/sing-box'
     server_path = shutil.which('ssserver')
     if not server_path:
         raise RuntimeError('Install shadowsocks-rust with Homebrew first')
@@ -116,9 +116,9 @@ def main():
         with tempfile.TemporaryDirectory(prefix='shadowbat-integration-') as scratch:
             scratch = pathlib.Path(scratch)
             ports = set()
-            while len(ports) < 5:
+            while len(ports) < 6:
                 ports.add(free_port())
-            server_port, second_port, dead_port, socks_port, http_port = ports
+            server_port, second_port, dead_port, socks_port, http_port, api_port = ports
             for index, port in enumerate((server_port, second_port)):
                 outbound = OutboundServer(('127.0.0.1', 0), OutboundFixture)
                 outbound.fixture_port = httpd.server_port
@@ -154,10 +154,12 @@ def main():
                             str(ROOT / 'Tests/SmokeChecks.swift'), str(ROOT / 'Tests/TerminalProxyChecks.swift'),
                             str(ROOT / 'Tests/AutomaticSelectionChecks.swift'),
                             str(ROOT / 'Tests/GlobalProxyChecks.swift'),
+                            str(ROOT / 'Tests/RoutingChecks.swift'),
+                            str(ROOT / 'Tests/TunCancellationChecks.swift'),
                             '-o', str(harness)], check=True)
             subprocess.run([str(harness), str(core), str(server_port), str(socks_port), str(http_port),
                             str(httpd.server_port), str(servers[0].pid), str(second_port), str(servers[1].pid),
-                            str(dead_port)], check=True, timeout=180)
+                            str(dead_port), str(api_port)], check=True, timeout=180)
     finally:
         for server in servers:
             if server.poll() is None:

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shadowbat/data/repositories/shadowbat_repository.dart';
@@ -101,6 +102,34 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'macOS exposes direct configuration and saves through native model',
+    (tester) async {
+      repository.values['platform'] = 'macos';
+      await mount(tester);
+      await tester.tap(find.text('直连配置'));
+      await tester.pumpAndSettle();
+      final add = find.text('添加直连目标');
+      await tester.ensureVisible(add);
+      await tester.tap(add);
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const ValueKey('routing-rule-target')),
+        ' Example.COM. ',
+      );
+      await tester.tap(find.text('保存'));
+      await tester.pumpAndSettle();
+      final args = repository.calls
+          .singleWhere((call) => call.$1 == 'saveRouting')
+          .$2!;
+      expect(args['defaultAction'], 'proxy');
+      final rules = args['rules']! as List;
+      expect((rules.single as Map)['target'], 'example.com');
+      expect((rules.single as Map)['action'], 'direct');
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('native tray updates refresh Flutter and lock node edits', (
     tester,
   ) async {
@@ -141,6 +170,40 @@ void main() {
     expect(find.text('aes-256-gcm'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+    'macOS TUN uses session authorization and locks while connected',
+    (tester) async {
+      repository.values.addAll({
+        'platform': 'macos',
+        'tunSupported': true,
+        'useTun': false,
+      });
+      repository.emit();
+      await mount(tester);
+      await tester.tap(find.text('设置'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('连接时由 macOS 请求管理员授权'), findsOneWidget);
+      expect(find.text('以管理员身份重启'), findsNothing);
+      final toggle = find.byType(CupertinoSwitch);
+      expect(toggle, findsOneWidget);
+      await tester.tap(toggle);
+      await tester.pumpAndSettle();
+      expect(repository.calls.last.$1, 'setTun');
+      expect(repository.calls.last.$2, {'value': true});
+      repository.values.addAll({
+        'useTun': true,
+        'tunEnabled': true,
+        'canChangeSelection': false,
+      });
+      repository.emit();
+      await tester.pumpAndSettle();
+      final active = tester.widget<CupertinoSwitch>(toggle);
+      expect(active.value, isTrue);
+      expect(active.onChanged, isNull);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('failed credential save keeps editor open and explains failure', (
     tester,

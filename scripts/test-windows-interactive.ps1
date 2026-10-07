@@ -1,4 +1,4 @@
-param([string]$Configuration='Release', [switch]$TunnelOnly)
+param([string]$Configuration='Release', [switch]$TunnelOnly, [string]$DirectTarget)
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding
@@ -12,6 +12,10 @@ if (Test-Path $resultFile) { Remove-Item $resultFile }
 $name='ShadowbatIntegration-'+[guid]::NewGuid().ToString('N')
 $user=[Security.Principal.WindowsIdentity]::GetCurrent().Name
 $arguments='--isolated-preview --self-test --self-test-result="'+$resultFile+'"'
+if ($DirectTarget) {
+ if ($DirectTarget -notmatch '^[0-9a-fA-F:.]+$') { throw 'DirectTarget must be an IP address.' }
+ $arguments+=' --self-test-direct-target='+$DirectTarget
+}
 $action=New-ScheduledTaskAction -Execute $exe -Argument $arguments
 $runLevel='Limited'
 if ($TunnelOnly) {

@@ -4,7 +4,7 @@ import Foundation
 @MainActor
 enum AutomaticSelectionChecks {
     static func run(executable: URL, profile: ServerProfile, password: String,
-                    secondPort: Int, secondPID: Int32, deadPort: Int,
+                    secondPort: Int, secondPID: Int32, deadPort: Int, apiPort: Int,
                     ports: LocalPorts, directory: URL, terminal: TerminalProxyManager, url: String) async throws {
         let secondPassword = "second-temporary-test-password"
         let second = ServerProfile(name: "快速候选", host: "127.0.0.1", port: secondPort, method: "aes-256-gcm")
@@ -27,7 +27,7 @@ enum AutomaticSelectionChecks {
         let decoded = try JSONDecoder().decode(ServerProfile.self, from: JSONEncoder().encode(excluded))
         try SmokeChecks.check(!decoded.participatesInAutomaticSelection, "Excluded state was not persisted")
 
-        let engine = ProcessProxyEngine()
+        let engine = ProcessProxyEngine(probeURL: "http://probe.shadowbat.test/", probeInterval: "1s", testAPIPort: apiPort)
         var logs: [String] = []
         engine.onLog = { logs.append($0) }
         do {
@@ -56,25 +56,38 @@ enum AutomaticSelectionChecks {
                 .filter { $0.lastPathComponent.hasPrefix("run-") }
             try SmokeChecks.check(folders.count == 1, "Multiple cores/configurations created for automatic selection")
             let configuration = try JSONSerialization.jsonObject(with: Data(contentsOf: folders[0].appendingPathComponent("config.json"))) as! [String: Any]
-            try SmokeChecks.check((configuration["servers"] as? [[String: Any]])?.count == 3,
+            try SmokeChecks.check((configuration["outbounds"] as? [[String: Any]])?.filter { $0["type"] as? String == "shadowsocks" }.count == 3,
                                   "Candidate configurations were not sent to the shared core")
-            // Wait for log delivery, then require the faster reachable candidate over the first, offline candidate.
-            for _ in 0..<40 {
-                if logs.contains(where: { $0.contains("chose best TCP server") && $0.contains(":\(secondPort)") }) { break }
-                try await Task.sleep(for: .milliseconds(50))
+            // Wait for a successful encrypted request: the first candidate is offline,
+            // so success proves that urltest selected a reachable node.
+            var selected = false
+            for _ in 0..<30 {
+                do { try SmokeChecks.curl(["--proxy", "http://127.0.0.1:\(ports.http)", url]); selected = true; break }
+                catch { try await Task.sleep(for: .milliseconds(200)) }
             }
-            try SmokeChecks.check(logs.contains { $0.contains("chose best TCP server") && $0.contains(":\(secondPort)") },
-                                  "Core did not select the reachable, faster TCP candidate: \(logs.joined(separator: "\n").prefix(6000))")
-            try SmokeChecks.curl(["--proxy", "http://127.0.0.1:\(ports.http)", url])
+            try SmokeChecks.check(selected, "Core did not select a reachable candidate")
+            func selectedNode() async -> String? {
+                guard let (data, _) = try? await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(apiPort)/proxies/proxy")!),
+                      let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                return state["now"] as? String
+            }
+            for _ in 0..<60 {
+                if await selectedNode() == "node-\(second.id.uuidString)" { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let initialSelection = await selectedNode()
+            try SmokeChecks.check(initialSelection == "node-\(second.id.uuidString)", "URL test did not select the faster candidate: \(initialSelection ?? "nil")")
             try SmokeChecks.curl(["--socks5-hostname", "127.0.0.1:\(ports.socks)", url])
             kill(secondPID, SIGTERM)
-            let deadline = Date().addingTimeInterval(60)
-            while Date() < deadline {
-                if logs.contains(where: { $0.contains("switched best TCP server") && $0.contains("to 127.0.0.1:\(profile.port)") }) { break }
-                try await Task.sleep(for: .milliseconds(200))
+            try await Task.sleep(for: .milliseconds(300))
+            var failedOver = false
+            for _ in 0..<30 {
+                do { try SmokeChecks.curl(["--proxy", "http://127.0.0.1:\(ports.http)", url]); failedOver = true; break }
+                catch { try await Task.sleep(for: .milliseconds(200)) }
             }
-            try SmokeChecks.check(logs.contains { $0.contains("switched best TCP server") && $0.contains("to 127.0.0.1:\(profile.port)") },
-                                  "Core did not fail over to the remaining reachable candidate")
+            try SmokeChecks.check(failedOver, "Core did not fail over to the remaining reachable candidate")
+            let fallbackSelection = await selectedNode()
+            try SmokeChecks.check(fallbackSelection == "node-\(profile.id.uuidString)", "Failover selected the wrong candidate")
             try SmokeChecks.check(engine.process?.processIdentifier == pid && engine.isRunning,
                                   "Failover restarted the global proxy service")
             let terminalState = try Data(contentsOf: terminal.stateFile)

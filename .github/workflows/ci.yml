@@ -125,7 +125,14 @@ jobs:
           cache: true
       - run: flutter pub get --enforce-lockfile
       - run: python3 scripts/test-helper.py
+      - run: python3 scripts/test-macos-proxy-recovery.py
+      - run: python3 scripts/test-macos-port-cleanup.py
+      - run: python3 scripts/test-macos-quit.py
+      - run: python3 scripts/test-macos-tray-position.py
+      - run: sh scripts/prepare-core.sh
       - run: sh scripts/build-macos-ci.sh
+      - name: Validate app TUN forwarding and crash cleanup
+        run: python3 scripts/test-macos-tun-app.py --sudo-authorization
       - name: Package and verify DMG
         run: sh scripts/package-macos.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

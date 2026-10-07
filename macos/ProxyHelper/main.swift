@@ -5,6 +5,19 @@ import os
 
 private let logger = Logger(subsystem: ProxyHelperIdentity.serviceName, category: "daemon")
 
+// This administrator-authorized, per-session path never registers or weakens the XPC service.
+if CommandLine.arguments.dropFirst().first == "--tun-session" {
+    do {
+        guard CommandLine.arguments.count == 3 else { throw TunWire.error("TUN 参数无效。") }
+        let core = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("sing-box")
+        try TunSessionSupervisor.run(socketPath: CommandLine.arguments[2], coreURL: core)
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
+
 private final class HelperSession: NSObject, ProxyHelperProtocol {
     let id = UUID()
     let uid: uid_t

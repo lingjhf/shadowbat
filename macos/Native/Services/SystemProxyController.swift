@@ -4,13 +4,14 @@ import Foundation
 /// New changes go through the daemon. The old manager is only for one-time legacy recovery.
 @MainActor
 final class SystemProxyController {
-    let helper = ProxyHelperClient()
+    let helper: any SystemProxyHelping
     private let legacy: SystemProxyManager
     private let receipt: URL
     private var helperHasBackup = false
     private var generation = 0
 
-    init(directory: URL) {
+    init(directory: URL, helper: (any SystemProxyHelping)? = nil) {
+        self.helper = helper ?? ProxyHelperClient()
         legacy = SystemProxyManager(directory: directory)
         receipt = directory.appendingPathComponent("helper-proxy-session")
     }
@@ -47,12 +48,19 @@ final class SystemProxyController {
         }
     }
 
-    func restore() async throws -> [String] {
+    func restore(repairUnavailable: Bool = false) async throws -> [String] {
         generation += 1
         var conflicts: [String] = []
         if legacy.hasBackup { conflicts += try legacy.restore() }
         if helperHasBackup || FileManager.default.fileExists(atPath: receipt.path) {
-            let status = try await helper.restore()
+            let status: ProxyHelperStatus
+            do { status = try await helper.restore() }
+            catch is ProxyHelperClient.ConnectionFailure where repairUnavailable {
+                // Reload only for transport/version failures. Lease conflicts and
+                // failed preference writes must never restart another session.
+                try await helper.repairInstallation()
+                status = try await helper.restore()
+            }
             helperHasBackup = status.hasBackup && status.ownerUID == getuid()
             conflicts += status.conflicts
             if !helperHasBackup { try removeReceipt() }

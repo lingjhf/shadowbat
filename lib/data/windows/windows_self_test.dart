@@ -1,3 +1,6 @@
+import 'windows_routing_self_test.dart';
+import '../../domain/routing/routing_settings.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -24,19 +27,40 @@ Future<void> runWindowsSelfTest(
     resultArgument?.substring('--self-test-result='.length) ??
         p.join(Directory.current.path, 'windows-self-test.json'),
   );
+  final directTarget = args
+      .where((v) => v.startsWith('--self-test-direct-target='))
+      .firstOrNull
+      ?.split('=')
+      .last;
   final tunnelOnly = args.contains('--self-test-tun-only');
   final results = <String>[];
   WindowsShadowbatRepository? repository;
   Process? server;
+  int? serverExit;
+  final serverLogs = StringBuffer();
   HttpServer? http;
   final fixtureFiles = <File>[];
   final credentialIDs = <String>[];
   Object? failure;
   Future<int> freePort() async {
-    final s = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-    final port = s.port;
-    await s.close();
-    return port;
+    // Windows can reserve a UDP range even when its TCP ports are available.
+    for (var attempt = 0; attempt < 30; attempt++) {
+      final s = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      try {
+        final udp = await RawDatagramSocket.bind(
+          InternetAddress.loopbackIPv4,
+          s.port,
+        );
+        final port = s.port;
+        udp.close();
+        return port;
+      } on SocketException {
+        // Select another port instead of launching a partially bound fixture.
+      } finally {
+        await s.close();
+      }
+    }
+    throw StateError('No free TCP/UDP port for the native fixture.');
   }
 
   void check(bool value, String reason) {
@@ -71,7 +95,7 @@ Future<void> runWindowsSelfTest(
         await request.response.close();
       }),
     );
-    final url = 'http://127.0.0.1:${http.port}/';
+    final url = 'http://198.18.0.123:${http.port}/';
     final serverPort = await freePort(),
         socks = await freePort(),
         localHTTP = await freePort();
@@ -79,7 +103,7 @@ Future<void> runWindowsSelfTest(
     fixtureFiles.add(config);
     await config.writeAsString(
       jsonEncode({
-        'log': {'level': 'error'},
+        'log': {'level': 'info'},
         'inbounds': [
           {
             'type': 'shadowsocks',
@@ -95,7 +119,6 @@ Future<void> runWindowsSelfTest(
         'route': {
           'rules': [
             {
-              'ip_cidr': ['198.18.0.123/32'],
               'action': 'route',
               'outbound': 'direct',
               'override_address': '127.0.0.1',
@@ -111,8 +134,10 @@ Future<void> runWindowsSelfTest(
       '-c',
       config.path,
     ], workingDirectory: p.dirname(core));
-    server.stdout.listen((_) {});
-    server.stderr.listen((_) {});
+    server.stdout.transform(utf8.decoder).listen(serverLogs.write);
+    server.stderr.transform(utf8.decoder).listen(serverLogs.write);
+    unawaited(server.exitCode.then((value) => serverExit = value));
+    var serverReady = false;
     for (var i = 0; i < 50; i++) {
       try {
         final socket = await Socket.connect(
@@ -121,11 +146,18 @@ Future<void> runWindowsSelfTest(
           timeout: const Duration(milliseconds: 100),
         );
         socket.destroy();
+        serverReady = true;
         break;
       } catch (_) {
         await Future<void>.delayed(const Duration(milliseconds: 100));
       }
     }
+    if (!serverReady || serverExit != null) {
+      throw StateError(
+        'Fixture server did not listen (exit $serverExit): $serverLogs',
+      );
+    }
+    check(true, 'local encrypted fixture listener is ready');
     final id = DateTime.now().microsecondsSinceEpoch.toRadixString(16);
     final profile = ServerProfile(
       id: id,
@@ -158,8 +190,45 @@ Future<void> runWindowsSelfTest(
         ).readAsString()).contains('temporary-fixture-password'),
         'profiles contain no passwords',
       );
+      var slowCompleted = false;
+      final slowNative = platform.invoke('testWorkerDelay').then((_) {
+        slowCompleted = true;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      final uiWatch = Stopwatch()..start();
+      await platform.invoke('updateTray', {
+        'stateLabel': '正在连接',
+        'state': 'starting',
+        'busy': true,
+      });
+      check(
+        !slowCompleted && uiWatch.elapsedMilliseconds < 400,
+        'native UI responds during 1200 ms worker operation (${uiWatch.elapsedMilliseconds} ms)',
+      );
+      uiWatch.reset();
+      check(
+        await platform.invoke('beginShutdown') == true &&
+            !slowCompleted &&
+            uiWatch.elapsedMilliseconds < 400,
+        'quit hides native UI immediately during pending cleanup (${uiWatch.elapsedMilliseconds} ms)',
+      );
+      await platform.invoke('cancelShutdown');
+      await slowNative;
       await repository.command('setSelectionMode', {'value': 'manual'});
       await repository.command('setManualNode', {'id': id});
+      await repository.command(
+        'saveRouting',
+        const RoutingSettings(
+          rules: [
+            RoutingRule(
+              id: 'direct-fixture',
+              type: RouteMatch.ip,
+              target: '101.33.73.2',
+              action: RouteAction.direct,
+            ),
+          ],
+        ).toMap(),
+      );
       await repository.command('setService', {'value': true});
       check(
         repository.snapshot().state == 'connected',
@@ -168,6 +237,15 @@ Future<void> runWindowsSelfTest(
       check(
         await fetch(localHTTP, url) == 'shadowbat-windows-encrypted-fixture',
         'encrypted HTTP through Shadowsocks',
+      );
+      check(
+        await fetch(localHTTP, 'http://127.0.0.1:${http.port}/') ==
+            'shadowbat-windows-encrypted-fixture',
+        'local HTTP stays direct alongside public proxy fallback',
+      );
+      check(
+        repository.snapshot().routing.defaultAction == RouteAction.proxy,
+        'public traffic uses fixed proxy fallback with direct exceptions',
       );
       final curl = await Process.run('curl.exe', [
         '--max-time',
@@ -231,6 +309,16 @@ Future<void> runWindowsSelfTest(
     }
     // Validate the production TUN schema without changing system routes.
     final tunFile = File(p.join(directory, 'tun-check.json'));
+    if (!tunnelOnly) {
+      results.addAll(
+        await testWindowsRouting(
+          core: core,
+          directory: directory,
+          profile: profile,
+          directTarget: directTarget,
+        ),
+      );
+    }
     fixtureFiles.add(tunFile);
     final tunConfig = singBoxConfig(
       profiles: [profile],
@@ -316,7 +404,7 @@ Future<void> runWindowsSelfTest(
       await repository.command('deleteProfile', {'id': id});
     }
   } catch (e, stack) {
-    failure = '$e\n$stack';
+    failure = '$e\n$stack\nFixture exit: $serverExit\n$serverLogs';
   } finally {
     if (repository != null) {
       try {
