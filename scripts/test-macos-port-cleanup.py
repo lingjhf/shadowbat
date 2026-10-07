@@ -8,6 +8,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import textwrap
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MAC = ROOT / 'macos'
@@ -46,9 +47,36 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def check_signal_permission(directory, source):
+    # Run the production shell body, simulating EPERM for the child signal probe.
+    # This reproduces sudo ownership without requiring root or changing networking.
+    script = textwrap.dedent(source.split('let script = """', 1)[1].split('"""', 1)[0])
+    runtime = directory / 'permission-runtime'
+    control = directory / 'permission-control'
+    runtime.mkdir()
+    control.mkdir()
+    child = subprocess.Popen(['/bin/sleep', '30'])
+    denial = f'kill() {{ if [ "$1" = -0 ] && [ "$2" = "{child.pid}" ]; then return 1; fi; command kill "$@"; }}\n'
+    watcher = subprocess.Popen(['/bin/sh', '-c', denial + script, 'permission-fixture',
+                                str(os.getpid()), str(child.pid), str(runtime), str(control)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(.5)
+        assert watcher.poll() is None and runtime.is_dir() and control.is_dir(), \
+            'A signal-permission denial deleted a live TUN control directory'
+        print('PASS: signal-permission denial leaves live launcher and control directories intact')
+    finally:
+        if watcher.poll() is None:
+            watcher.terminate()
+        watcher.wait(timeout=5)
+        child.terminate()
+        child.wait(timeout=5)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix='shadowbat-port-cleanup-') as temporary:
         directory = pathlib.Path(temporary)
+        check_signal_permission(directory, (MAC / "Native/Services/ProcessProxyEngine.swift").read_text())
         core = directory / 'fake-core'
         core.write_text(FAKE_CORE)
         core.chmod(0o700)

@@ -292,16 +292,21 @@ final class ProcessProxyEngine {
         // Verify the unique configuration path before signalling, including
         // after the grace period, to avoid targeting a reused process ID.
         let script = """
+        alive() {
+          # A sudo launcher belongs to root: kill -0 returns EPERM while it is alive.
+          # ps checks existence without requiring permission to signal the process.
+          /bin/ps -p "$1" -o pid= >/dev/null 2>&1
+        }
         owned() {
-          kill -0 "$2" 2>/dev/null || return 1
+          alive "$2" || return 1
           case "$(/bin/ps -ww -p "$2" -o command=)" in
             *"$3/config.json"*) return 0 ;;
             *"$4/control.sock"*) [ -n "$4" ] ;;
             *) return 1 ;;
           esac
         }
-        while kill -0 "$1" 2>/dev/null && kill -0 "$2" 2>/dev/null; do sleep 0.2; done
-        if ! kill -0 "$1" 2>/dev/null && owned "$@"; then
+        while alive "$1" && alive "$2"; do sleep 0.2; done
+        if ! alive "$1" && owned "$@"; then
           kill -TERM "$2" 2>/dev/null
           count=0
           while owned "$@" && [ "$count" -lt 10 ]; do sleep 0.2; count=$((count + 1)); done

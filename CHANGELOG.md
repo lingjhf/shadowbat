@@ -7,6 +7,7 @@
 - Bound XPC and service unregistration waits, finish overlapping requests safely, and release the recovery UI on failure so it can be retried.
 - Preserve active lease conflicts without restarting the helper; refresh approval status and clear stale receipts only after confirmed restoration.
 - Add isolated recovery and real anonymous XPC timeout regression checks.
+- Keep TUN control directories alive when the elevated launcher exists but cannot be signalled by the desktop user.
 
 ## 1.3.7+15
 
