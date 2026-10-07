@@ -99,7 +99,7 @@ jobs:
           ./scripts/package-windows-installer.ps1
           $installer = Get-ChildItem dist/windows/*-setup.exe | Select-Object -First 1
           ./scripts/verify-windows-installer.ps1 -InstallerPath $installer.FullName
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-x64
           path: |
@@ -136,7 +136,7 @@ jobs:
         run: python3 scripts/test-macos-tun-app.py --sudo-authorization
       - name: Package and verify DMG
         run: sh scripts/package-macos.sh
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-arm64
           path: |
